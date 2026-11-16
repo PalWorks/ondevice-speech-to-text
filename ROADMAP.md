@@ -11,7 +11,7 @@
 > Timestamps are ISO 8601 to the second, in UTC. Git history starts at the first public commit
 > (2026-11-16), so Raised dates for earlier items come from CHANGELOG.md.
 >
-> _Last updated: 2026-11-16T14:13:16+00:00 (row 17 closed, row 22 added: published as a public repository)._
+> _Last updated: 2026-11-16T14:43:54+00:00 (row 18 closed: tests/ committed)._
 
 ## 0. North star: every open item, one row each
 
@@ -21,7 +21,6 @@ Grouped by state (Open, Decision, Waiting, Blocked, Deferred, Recurring), then b
 | # | Bucket | Priority | State | Size | Impact | Raised | Problem | Solution or next step |
 |---|---|---|---|---|---|---|---|---|
 | 16 | §3.1 | P2 | **Open** | S | M | 2026-11-16 | Meeting mode, call audio, echo dropping and pause detection were tested only with synthetic voices on a hidden display; real voices, a real call and the owner's loud mic background are untested. | Owner runs one real call and one in-room conversation; the agent reviews the transcripts and `dictate-stats`, then tunes `speech_ratio`, the 0.56 and 0.55 speaker thresholds and the echo rule. [§8.1](#81-row-16-real-world-validation) |
-| 18 | §3.3 | P2 | **Open** | M | M | 2026-11-16 | The hidden-display test harness (shims, clips, scenarios) exists only in a session scratchpad, so every future change rebuilds it by hand and regressions can slip through. | Commit it as `tests/` (shims, clip builder, five scenarios, one runner) following docs/TESTING.md; no owner data involved. |
 | 19 | §3.2 | P3 | **Deferred** | L | L | 2026-11-16 | When two people speak within one phrase (no 0.7 s pause), the whole phrase gets one speaker label. | Brought back if real transcripts show mixed turns: add speaker-change segmentation inside phrases (pyannote segmentation 3.0 via sherpa-onnx). |
 | 20 | §3.2 | P3 | **Deferred** | M | L | 2026-11-16 | Phrases held while the owner is in another window are transcribed one by one, so words cut at pause boundaries may be less accurate than one pass. | Brought back if held text shows boundary errors: re-run held phrases' audio as one piece before inserting. |
 | 21 | §3.1 | P3 | **Deferred** | ? | L | 2026-10-20 | `xdotool type` can mistype some non-ASCII characters in a few apps (noted in ANALYSIS, Known limits); terminals already get long text by paste. | Brought back if a mistyped character is seen: paste all phrases containing non-ASCII characters instead of typing them. |
@@ -104,7 +103,6 @@ repeat §0 in one line; §0 holds the problem and solution. Closed rows keep onl
 | # | Item | Section | State | Size | Impact |
 |---|---|---|---|---|---|
 | 16 | Real-world validation and tuning of meetings, calls and pause detection | §3.1 | **Open**: waiting for the owner's first real call | S | M |
-| 18 | Commit the hidden-display test harness as `tests/` | §3.3 | **Open** | M | M |
 | 19 | Speaker changes inside one phrase | §3.2 | **Deferred** | L | L |
 | 20 | Re-transcribe held phrases as one piece | §3.2 | **Deferred** | M | L |
 | 21 | Non-ASCII characters mistyped by `xdotool type` | §3.1 | **Deferred** | ? | L |
@@ -124,6 +122,7 @@ repeat §0 in one line; §0 holds the problem and solution. Closed rows keep onl
 | 14 | Meeting button | §3.2 | **Done** 2026-11-16 | Was Small | M |
 | 15 | Documentation set (README, AGENTS, ROADMAP, docs) | §3.3 | **Done** 2026-11-16 | Was Medium | M |
 | 17 | Put the project under version control | §3.3 | **Done** 2026-11-16: public repo chosen instead of private (row 22) | Was Trivial | M |
+| 18 | Commit the hidden-display test harness as `tests/` | §3.3 | **Done** 2026-11-16: found and fixed a too-loose echo rule | Was Medium | M |
 | 22 | Publish as a public repository, AGPL 3.0 plus commercial licence | §3.3 | **Done** 2026-11-16 | Was Small | M |
 
 ---
@@ -140,7 +139,7 @@ Rows 19 and 20. Both are improvements to work already shipped, held until real u
 
 ### 3.3 Engineering
 
-Row 18. With the git repository (rows 17, 22) it makes changes to the production F9 script safe to undo and quick to verify.
+Nothing open. Rows 17, 18 and 22 (git, tests, publication) made changes to the production F9 script safe to undo and quick to verify.
 
 ## 4. Deferred: decided, waiting on something
 
@@ -167,7 +166,7 @@ One detail document:
 
 | Document | Covers |
 |---|---|
-| [docs/TESTING.md](docs/TESTING.md) | The hidden-display harness that row 18 commits |
+| [docs/TESTING.md](docs/TESTING.md) | The test suite in `tests/`, its scenarios and pass criteria |
 
 ## 7. Closed, kept for the reasoning
 

@@ -74,7 +74,7 @@ The terms below have a precise meaning in the code (`bin/dictate-live`, `lib/spe
 | Automatic switch | Dictation becomes a meeting when a second voice is confirmed |
 | Manual switch | The box's Meeting button: becomes a meeting at once (`meeting_manual`) |
 | Call open | Another app is recording the mic (per `pactl`), or a Meet, Zoom or Teams window is showing. Starts the call stream; it stops 15 s after the call ends |
-| Echo | The call's audio heard again by the mic through laptop speakers. A mic phrase is dropped as echo when 60% of its words appear, in order, in call phrases within 1 s of it (`echo_dropped`) |
+| Echo | The call's audio heard again by the mic through laptop speakers. A mic phrase is dropped as echo when call phrases overlap at least half of it in time and contain 60% of its words in order (`echo_dropped`) |
 | Transcript | `transcripts/<YYYY-MM-DD HHMM> meeting.md`: timestamps, `Speaker N` labels, one paragraph per speaker turn |
 
 ## Outcomes (the `outcome` log field)

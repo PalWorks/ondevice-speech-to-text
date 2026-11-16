@@ -66,7 +66,7 @@ On-device dictation for one person's XFCE (X11) laptop. F9 starts a session, spe
 1. Read `README.md`, the relevant doc, and `ROADMAP.md` for related rows.
 2. Start from a clean `git status`.
 3. Make the change. Run `/usr/bin/python3 -m py_compile bin/dictate-live` and `uvx pyflakes bin/dictate-live lib/speakers.py`.
-4. Test on the hidden display (`docs/TESTING.md`): at least the dictation scenario, plus the meeting scenarios if anything near phrases, speakers or calls changed.
+4. Run `tests/run.sh` (all scenarios, about 7 minutes; `docs/TESTING.md`). For a docs-only change, `tests/run.sh --static` is enough. Add a scenario for new behaviour.
 5. Run `./install.sh --check`; every line must be `[ok]`.
 6. Update in the same session: `CHANGELOG.md` (newest first), `docs/DISCUSSION.md` (local only, git-ignored: what the owner asked and decided), `docs/DECISIONS.md` (if a decision was made), `ROADMAP.md` (rows opened, advanced or closed), `README.md` and `docs/ARCHITECTURE.md` (if behaviour or structure changed), `docs/ANALYTICS.md` (if log fields changed).
 7. Report to the owner: what changed, how it was tested, what was not tested, and the next step.

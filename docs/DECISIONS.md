@@ -127,7 +127,7 @@ Architecture decision records: why the system is the way it is. Each record is s
 ## D-14 Computer sound only during calls
 
 - **Context.** Remote participants are not heard by the mic when the owner wears headphones. The owner uses both headphones and speakers.
-- **Decision.** Record the speaker monitor (`parec`) only while a call is open: another app is recording the mic, or a Meet, Zoom or Teams window shows. Mic phrases during a call wait up to 4 s for the call's copy; 60% of words matching in order means echo, dropped. During a call, only the call's own copy counts towards meeting detection.
+- **Decision.** Record the speaker monitor (`parec`) only while a call is open: another app is recording the mic, or a Meet, Zoom or Teams window shows. Mic phrases during a call wait up to 4 s for the call's copy; a call phrase overlapping at least half of the mic phrase in time, with 60% of its words matching in order, means echo, dropped. (A looser ±1 s window, used until 2026-11-16, also dropped the next speaker's turn when it repeated the same words; found by the test suite.) During a call, only the call's own copy counts towards meeting detection.
 - **Consequences.** A video playing during dictation is not transcribed. Call speech is never inserted into a window.
 
 ## D-15 Tuning in the box

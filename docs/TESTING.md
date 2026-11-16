@@ -1,117 +1,94 @@
 # Testing
 
-Last updated: 2026-11-16T12:52:17+00:00
+Last updated: 2026-11-16T14:43:54+00:00
 
-How to test changes without touching the owner's desktop, data or F9 session. There is no committed test suite yet (ROADMAP row 18); this file is the procedure the harness follows.
+How to test changes without touching the user's desktop, data or running F9 session. The suite is in `tests/`.
+
+## Run it
+
+```bash
+tests/run.sh                    # static checks, speaker helper, 7 scenarios (about 7 minutes)
+tests/run.sh --static           # static checks and the speaker helper only (seconds)
+tests/run.sh dictation tune     # static checks plus named scenarios
+tests/run.sh --slow             # also the 2.5-minute monologue
+tests/run.sh --keep             # keep the work folder (clips, scratch project, logs) for inspection
+./install.sh --check            # always, after any change
+```
+
+Exit code 0 means everything passed. Set `TMPDIR` to choose where the work folder goes. The first run downloads the test speech (about 350 kB) into `tests/.cache/` (git-ignored).
+
+Requirements on top of a normal install: `Xvfb`, `xfwm4`, `xfce4-terminal`, `dbus-run-session`, `ffmpeg` and numpy for `/usr/bin/python3`; `uvx` for pyflakes (skipped if missing).
 
 ## Principles
 
-1. **Never touch the owner's screen.** No typing into their windows, no pointer moves, no focus changes. Everything visual runs on a private X display (`Xvfb :99`) with its own window manager.
-2. **Never touch the owner's data.** Run a scratch copy of the code, so `data/`, `transcripts/` and the live F9 session (`$XDG_RUNTIME_DIR/dictate-live/session.pid`) are untouched.
-3. **Use the real engines.** whisper-server, Parakeet and the speaker helper run for real; only audio capture, call detection and notifications are faked.
-4. **Leave nothing running.** Check `pgrep -x Xvfb` before and after. A stray Xvfb from an earlier run once answered a later test's windows and produced a false failure (2026-11-16).
+1. **Never touch the user's screen.** No typing into their windows, no pointer moves, no focus changes. Everything visual runs on a private X display (the first free number from `:99`) with its own window manager (xfwm4), under its own D-Bus session.
+2. **Never touch the user's data.** Each run works on a scratch copy of `bin/dictate-live`, `config/` and `lib/` (with `models/` and `.venv/` linked), and its own `XDG_RUNTIME_DIR`, so `data/`, `transcripts/` and the live F9 session's pidfile are untouched.
+3. **Use the real engines.** whisper-server, Parakeet and the speaker helper run for real; only audio capture, call detection, sounds and notifications are faked.
+4. **Leave nothing running.** The runner stops the display and every process it started, even after a failure.
 
-## Static checks (every change)
+## What `tests/run.sh` does
 
-```bash
-cd ~/Documents/"OnDevice Speech To Text"
-/usr/bin/python3 -m py_compile bin/dictate-live bin/dictate-stats
-uvx pyflakes bin/dictate-live lib/speakers.py
-./install.sh --check            # every line [ok]
-rm -rf bin/__pycache__ lib/__pycache__
-```
+**Table X1: Steps**
 
-## The scratch copy
+| Step | Checks |
+|---|---|
+| Static | Python compiles (system Python and `.venv`), shell syntax, pyflakes, an `SPDX-License-Identifier: AGPL-3.0-only` header in every source file |
+| Speaker helper | Three phrases from two voices through `lib/speakers.py`: the helper survives a new speaker, and the final regrouping finds exactly 2 speakers with the first and third phrase together |
+| Scenarios | `tests/e2e.py` under `dbus-run-session`, below |
 
-```bash
-S=<session scratchpad>/e2e                      # never inside the project folder
-P=~/Documents/"OnDevice Speech To Text"
-mkdir -p "$S"/{proj/bin,proj/data,shim,run}
-cp "$P/bin/dictate-live" "$S/proj/bin/"
-cp -r "$P/config" "$P/lib" "$S/proj/"
-ln -sfn "$P/models" "$S/proj/models"
-ln -sfn "$P/.venv"  "$S/proj/.venv"
-```
+## Test speech
 
-`bin/dictate-live` finds its project through `realpath`, so the copy writes `data/` and `transcripts/` inside `$S/proj`. Set `XDG_RUNTIME_DIR=$S/run` so its pidfile never meets the owner's session.
+whisper.cpp's public sample `samples/jfk.wav` (11 s, 16 kHz; pinned to tag v1.7.5 and checked by SHA-256). The word "country" appears twice in it, so counting it tells how much text arrived. A second voice is the same clip pitch-shifted to 0.80 (same words and speed); the speaker model scores it about 0.3 similar to the original, well under the 0.56 new-speaker threshold.
 
-## Shims (first on PATH)
+**Table X2: Clips built for each run**
 
-**Table X1: Shims**
+| Clip | Content |
+|---|---|
+| `dictation` | Four copies of voice A with 1.5 s gaps, 15 s of trailing silence |
+| `noisy` | The same plus a stationary rumble at about 650 RMS, the background measured on the reference mic |
+| `silence` | 20 s of silence |
+| `room` | A, B, A, B, A |
+| `call_mic` and `call_side` | A on the mic; B only on the computer's sound, and also on the mic at a third of the volume 50 ms late (laptop speakers), plus light noise |
+| `monologue` | Twelve copies of A |
 
-| Tool | Replaced by | Why |
-|---|---|---|
-| `arecord` | `exec ffmpeg -v quiet -re -i <clip.wav> -f s16le -ac 1 -ar 16000 -` | Plays a known clip in real time. Add trailing silence to the clip instead of looping; never use `apad` (faster than real time). For call tests, also write `date +%s.%N` to a file so `parec` can start at the same offset |
-| `parec` | `ffmpeg -re -ss <seconds since arecord started> -i call.wav ...` | The other side of a call, aligned with the mic clip |
-| `pactl` | Prints `[]`, or for a call a fake source-output: `[{"index":9,"source":1,"properties":{"application.process.binary":"chrome","application.process.id":"4242"}}]`, and for `list sources` a mic plus a `.monitor` source | Controls whether a call looks open |
-| `paplay` | `exit 0` | No sounds |
-| `notify-send` | Appends its arguments to a file | Checks notifications without showing them |
+## Shims
 
-`xdotool` and `xclip` run for real, on display `:99` only.
+**Table X3: Fakes, first on PATH**
 
-## The test display
+| Tool | Replaced by |
+|---|---|
+| `arecord` | ffmpeg playing the scenario's clip in real time (`-re`); records its start time |
+| `parec` | ffmpeg playing `call_side` from the same moment as the mic clip |
+| `pactl` | A fake source-output from "chrome" when the scenario says a call is open, otherwise none |
+| `paplay` | Nothing |
+| `notify-send` | Appends to a file |
 
-```bash
-cat > "$S/run-scenario.sh" <<'EOF'
-#!/bin/bash
-export DISPLAY=:99 XDG_RUNTIME_DIR=$S/run PATH=$S/shim:$PATH
-Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 & sleep 1
-xfwm4 --display=:99 --compositor=off --sm-client-disable >/dev/null 2>&1 & sleep 2
-xfce4-terminal --disable-server --title=termA -x sh -c "stty -icanon -echo; cat > $S/a.txt" >/dev/null 2>&1 &
-xfce4-terminal --disable-server --title=termB -x sh -c "stty -icanon -echo; cat > $S/b.txt" >/dev/null 2>&1 &
-sleep 3
-A=$(xdotool search --onlyvisible --name termA | head -1)
-xdotool windowactivate --sync "$A"
-/usr/bin/python3 "$S/proj/bin/dictate-live" 2>"$S/err.log" & DL=$!
-# ... scenario steps: xdotool windowactivate, sleeps, screenshots ...
-/usr/bin/python3 "$S/proj/bin/dictate-live"      # the second F9 press
-wait $DL
-kill $(jobs -p) 2>/dev/null
-EOF
-dbus-run-session -- bash "$S/run-scenario.sh"
-```
-
-- `dbus-run-session` keeps xfwm4's session bus away from the owner's.
-- The terminals write what they receive to `a.txt` and `b.txt` (`-icanon` so nothing waits for Enter).
-- Screenshot: `ffmpeg -v quiet -y -f x11grab -video_size 1280x800 -i :99 -frames:v 1 shot.png`.
-- Clicking a box button: find the box's top edge in a raw screenshot (first row of colour (28, 28, 32) in column x=330), then `xdotool mousemove <x> <top+33> click 1`. Buttons in the top row, left to right: Meeting, Tune, Cancel.
-
-## Test audio
-
-Speech clips with known content, joined with silences by ffmpeg (`concat` filter) or numpy:
-
-- **Dictation clip**: four phrases of one voice with 1.5 s gaps and 15 s of trailing silence.
-- **Noisy clip**: the same mixed with pink noise at about 650 RMS (`anoisesrc=c=pink:a=0.11`, `amix ... normalize=0`), close to the owner's measured background.
-- **Room meeting clip**: voice A and voice B alternating, B reaching 23 s over three phrases.
-- **Call pair**: `mic_call.wav` (voice A, plus voice B at 0.35 volume 50 ms late, as through laptop speakers, plus light noise) and `call.wav` (voice B alone at the same times).
-- **Monologue**: one voice for 2.5 minutes.
+`xdotool` and `xclip` run for real, on the private display only. Box buttons are found by colour in a screenshot (button background over the box), so clicks do not depend on exact positions.
 
 ## Scenarios
 
-**Table X2: Scenarios and expected results**
+**Table X4: Scenarios and pass criteria**
 
-| # | Scenario | Pass when |
+| Scenario | Steps | Pass when |
 |---|---|---|
-| 1 | Dictation clip; switch to termB at 11 s, back at 23 s, to termB at 32 s, F9 at 39 s | All four phrases reach `a.txt` in order, `b.txt` empty, focus ends on termB; log: `typed`, `held_flushes` ≥ 1 |
-| 2 | Noisy clip, same steps | No words missing in `a.txt` (a sentence may be split) |
-| 3 | Silence only, F9 at 4 s; then Cancel (SIGTERM) mid-speech | `empty`; then `cancelled` with inserted phrases kept and `data/live` empty |
-| 4 | Room meeting clip | Outcome `meeting`, 2 speakers, transcript turns alternate correctly; before the switch, text typed into termA |
-| 5 | Call pair with the call `pactl` shim | `echo_dropped` = number of B phrases, `call_phrases` = the same, nothing of B in `a.txt`, transcript has each B line once |
-| 6 | Monologue | No meeting; every phrase typed |
-| 7 | Click Meeting 4 s in, F9 at 45 s | `a.txt` empty, `meeting_manual` true, transcript saved, "Transcript saved" shown |
-| 8 | Click Tune, then Sensitivity + and Pause + | Focus stays on termA; the copy's `config/dictate.conf` shows the new `speech_ratio` and `pause_ms` |
+| `dictation` | Dictation clip in termA; switch to termB at 15 s, back at 30 s, to termB at 44 s; second F9 at 57 s | Outcome `typed`, all 8 "country" in termA, termB empty, focus ends on termB, `held_flushes` ≥ 1 |
+| `noisy` | Same with the noisy clip | As above, at least 7 of 8 |
+| `empty-cancel` | Silence, F9 at 5 s; then dictation, SIGTERM at 20 s | `empty`; then `cancelled` with the inserted text kept and no file left in `data/live` |
+| `room-meeting` | Room clip, F9 at 65 s | Outcome `meeting`, 2 speakers, "Speaker 2" in the transcript |
+| `call-echo` | Call clips with a call open, F9 at 92 s | Outcome `meeting`, `call_phrases` ≥ 3, `echo_dropped` ≥ 2, at most 4 "country" typed (voice A before the switch), 12 to 14 in the transcript (no duplicates) |
+| `meeting-button` | Dictation clip, click Meeting at 4 s, F9 at 40 s | `meeting_manual` true, nothing typed into termA, transcript has the text, focus stayed on termA |
+| `tune` | Click Tune, then Sensitivity + and Pause + | Focus stayed on termA; the scratch config shows `speech_ratio = 2.25` and `pause_ms = 800` |
+| `monologue` (`--slow`) | Monologue clip, F9 at 165 s | Outcome `typed`, no meeting |
 
-Read results from `$S/proj/data/sessions.jsonl` (last line), `$S/a.txt`, `$S/b.txt`, `$S/proj/transcripts/` and `$S/err.log` (must have no traceback).
+Each line of output reads `PASS` or `FAIL`, the scenario, its duration and the measured values. A failing `tune` saves `tune-fail.png` in the work folder (use `--keep`).
 
-## Unit-level checks
+## Last full run
 
-- Speaker helper: pipe `{"cmd":"assign",...}` lines for three clips and `{"cmd":"final"}` into `.venv/bin/python -I lib/speakers.py models/nemo_en_titanet_small.onnx`; a new voice must get a new label without the helper dying.
-- Regrouping speed: 800 random 192-dimension vectors cluster in under a second (`final_labels`).
-- Insertion paths without a display: import `bin/dictate-live` with `SourceFileLoader`, point `PROJECT` and `BACKUP_FILE` at the scratch folder, and drive `_insert_final` with a shimmed `xdotool`.
-- Call detection on the real desktop is read-only and safe: `call_open(set())` should be `False` with no call open.
+2026-11-16 on the reference machine: all static checks, the speaker helper and 8 of 8 scenarios passed (`monologue` run separately). Phrase latency 0.6 to 1.1 s at load average 4; about 2.9 s at load average 12.
 
-## Afterwards
+## Adding a scenario
 
-- `pgrep -x Xvfb` prints nothing.
-- The owner's `data/` and `transcripts/` are unchanged (compare `ls -la` before and after).
-- `bin/__pycache__` and `lib/__pycache__` removed.
+1. Build its clip in `build_audio()` from voice A, voice B or silence; keep "country" counts predictable.
+2. Write `s_<name>(r)`: `r.setup(clip, call=...)`, `r.start()`, `r.at(seconds)` for timed steps, `r.press()` for the second F9; read `r.row()` (last log line), `r.text(r.out_a)`, `r.transcript()`.
+3. Return `(passed, detail)`, with the measured values in `detail`. Register it in `SCENARIOS` (and `SLOW` if it takes over two minutes).
+4. Update Table X4.

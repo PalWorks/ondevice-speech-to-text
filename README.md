@@ -174,6 +174,7 @@ dictate                    # basic mode: same engine, one pass at the end, no bo
 | `lib/active-app`, `lib/log_session.py` | App name and session logging for basic mode |
 | `config/dictate.conf` | All settings, commented |
 | `install.sh` | Install and `--check` self-test |
+| `tests/` | `run.sh` (all checks) and `e2e.py` (scenarios on a private display) |
 | `LICENSE`, `COMMERCIAL-LICENSE.md` | AGPL 3.0 text; how to get a commercial licence |
 | `models/` | Speech and speaker models, 1.9 GB (downloaded by `install.sh`) |
 | `.venv/` | Python venv for sherpa-onnx (created by `install.sh`) |
@@ -185,11 +186,13 @@ System links into the folder: `~/.local/bin/dictate`, `dictate-live`, `dictate-s
 
 ## Testing
 
-Changes are tested on a private hidden display (Xvfb with xfwm4) using a scratch copy of the code, the real engines, and recorded clips played as if from the mic, so the owner's screen, data and F9 session are never touched. Eight scenarios cover dictation with window switches, noise, silence and cancel, in-room and online meetings with echo, a long monologue, the Meeting button and the Tune panel. Procedure: [docs/TESTING.md](docs/TESTING.md). Static checks before every change:
-
 ```bash
-/usr/bin/python3 -m py_compile bin/dictate-live && uvx pyflakes bin/dictate-live lib/speakers.py && ./install.sh --check
+tests/run.sh            # static checks, speaker helper, 7 end-to-end scenarios (about 7 minutes)
+tests/run.sh --static   # seconds
+tests/run.sh --slow     # also a 2.5-minute monologue
 ```
+
+The scenarios run on a private hidden display (Xvfb with xfwm4) with a scratch copy of the code, the real engines, and public test speech played as if from the mic, so your screen, windows, data and F9 session are never touched. They cover dictation with window switches, noise, silence and cancel, in-room and online meetings with echo, the Meeting button, the Tune panel and a long monologue. Details: [docs/TESTING.md](docs/TESTING.md).
 
 ## Deployment and rollback
 
@@ -221,7 +224,7 @@ More: [docs/RUNBOOK.md](docs/RUNBOOK.md).
 
 ## Roadmap
 
-Open items, decisions and everything shipped: [ROADMAP.md](ROADMAP.md). Next: validate meetings and pause detection on a real call (row 16), commit the test harness (row 18).
+Open items, decisions and everything shipped: [ROADMAP.md](ROADMAP.md). Next: validate meetings and pause detection on a real call (row 16).
 
 ## Documentation
 

@@ -1005,7 +1005,10 @@ class Session:
         calls = [e for e in self.entries if e["stream"] == "call"]
         keep = []
         for item in self.echo_wait:
-            overlapping = [c for c in calls if c["t0"] < item["t1"] + 1 and c["t1"] > item["t0"] - 1]
+            # The echo covers the same moment: at least half of the shorter phrase overlaps.
+            overlapping = [c for c in calls
+                           if min(c["t1"], item["t1"]) - max(c["t0"], item["t0"])
+                           >= 0.5 * min(c["t1"] - c["t0"], item["t1"] - item["t0"])]
             text = " ".join(c["text"] for c in overlapping)
             if overlapping and similar(item["text"], text) >= 0.6:
                 self.stats["echo_dropped"] += 1

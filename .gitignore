@@ -10,3 +10,6 @@ docs/DISCUSSION.md
 
 __pycache__/
 *.pyc
+
+# Test speech downloaded by tests/e2e.py
+tests/.cache/

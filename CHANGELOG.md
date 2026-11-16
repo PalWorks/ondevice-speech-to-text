@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-11-16T14:43:54+00:00
+
+- **Test suite** in `tests/` (ROADMAP row 18): `tests/run.sh` runs static checks (compile, shell syntax, pyflakes, SPDX headers), a speaker-helper check, and `tests/e2e.py`, which plays public test speech (whisper.cpp's `samples/jfk.wav`, checksummed; a pitch-shifted copy as a second voice) into a scratch copy of the code on a private Xvfb display with xfwm4. Eight scenarios: dictation with window switches, noise, silence and cancel, in-room meeting, call with echo, Meeting button, Tune panel, and a slow monologue. All pass on the reference machine.
+- Fixed, found by the suite: echo detection compared a mic phrase with call phrases within ±1 s, which also caught the next speaker's turn when the words matched, dropping real speech. A call phrase must now overlap at least half of the mic phrase in time (`bin/dictate-live`, `_check_echo`).
+- docs/TESTING.md rewritten around the suite; README, AGENTS.md, DOMAIN.md, DECISIONS.md D-14 and ROADMAP updated. `tests/.cache/` git-ignored.
+
 ## 2026-11-16T14:13:33+00:00
 
 - **Published** as a public repository, github.com/PalWorks/ondevice-speech-to-text, dual-licensed: AGPL 3.0 (`LICENSE`, unmodified text from gnu.org) plus a commercial licence (`COMMERCIAL-LICENSE.md`; enquiries through GitHub issues, no personal contact published). `SPDX-License-Identifier: AGPL-3.0-only` added to every source file.
