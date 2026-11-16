@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# Print the WM_CLASS class name of the focused window (e.g. Google-chrome, Code).
+wid=$(xdotool getactivewindow 2>/dev/null) || { echo unknown; exit 0; }
+xprop -id "$wid" WM_CLASS 2>/dev/null | sed -nE 's/.*"([^"]*)"$/\1/p' | grep . || echo unknown

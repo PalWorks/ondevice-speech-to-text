@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# dictate: press once to start listening, press again to stop.
+# The transcript is typed into whichever window has focus.
+# Basic mode: no live preview (see bin/dictate-live for that). Kept as the
+# lightweight fallback; see README.md for which key runs which mode.
+#
+# Settings come from config/dictate.conf (final_engine, final_model, final_beam_size, prompt, language).
+# Overrides: DICTATE_FINAL_ENGINE (parakeet|whisper), DICTATE_MODEL (whisper model path),
+#            DICTATE_LANG (en, hi, ta, auto...)
+set -u
+
+BREW=/home/linuxbrew/.linuxbrew/bin
+PROJECT="$(dirname "$(dirname "$(realpath "$0")")")"
+MODELS="$PROJECT/models"
+# Read every setting in one Python call (one call per key cost ~50 ms each).
+eval "$(/usr/bin/python3 -I -c '
+import configparser, shlex, sys
+c = configparser.ConfigParser()
+c.read(sys.argv[1])
+get = lambda k, d: shlex.quote(c.get("dictate", k, fallback=d))
+print("CONF_MODEL=" + get("final_model", "ggml-large-v3-turbo-q5_0.bin"))
+print("CONF_BEAM=" + get("final_beam_size", "5"))
+print("CONF_ENGINE=" + get("final_engine", "parakeet"))
+print("CONF_PARAKEET=" + get("parakeet_model", "ggml-parakeet-tdt-0.6b-v3-q8_0.bin"))
+print("CONF_PROMPT=" + get("prompt", ""))
+print("CONF_LANG=" + get("language", "en"))
+print("CONF_SOUNDS=" + get("sounds", "true"))
+' "$PROJECT/config/dictate.conf")"
+MODEL="${DICTATE_MODEL:-$MODELS/$CONF_MODEL}"
+BEAM="$CONF_BEAM"
+ENGINE="${DICTATE_FINAL_ENGINE:-$CONF_ENGINE}"
+PARAKEET_MODEL="$MODELS/$CONF_PARAKEET"
+PROMPT="$CONF_PROMPT"
+VAD_MODEL="$MODELS/ggml-silero-v5.1.2.bin"
+LANG_CODE="${DICTATE_LANG:-$CONF_LANG}"
+MAX_SECONDS=300
+SOUNDS=/usr/share/sounds/freedesktop/stereo
+
+STATE="${XDG_RUNTIME_DIR:-/tmp}/dictate"
+mkdir -p "$STATE"
+WAV="$STATE/clip.wav"
+PIDFILE="$STATE/rec.pid"
+NOTIFY_ID="$STATE/notify.id"
+
+notify() { # message, timeout ms, icon
+  local id
+  id=$(cat "$NOTIFY_ID" 2>/dev/null || echo 0)
+  notify-send -a Dictation -p -r "$id" -t "$2" -i "$3" "Dictation" "$1" >"$NOTIFY_ID" 2>/dev/null
+}
+cue() { # the backgrounded command itself must drop fd 9, see the lock below
+  [ "$CONF_SOUNDS" = true ] || return 0
+  paplay "$SOUNDS/$1.oga" >/dev/null 2>&1 9>&- &
+}
+
+# Ignore presses while a previous clip is still being transcribed.
+exec 9>"$STATE/lock"
+flock -n 9 || exit 0
+
+start_listening() {
+  rm -f "$WAV"
+  nohup arecord -q -f S16_LE -r 16000 -c 1 -d "$MAX_SECONDS" "$WAV" >/dev/null 2>&1 9>&- &
+  echo $! >"$PIDFILE"
+  disown
+  date +%s.%N >"$STATE/started"
+  "$PROJECT/lib/active-app" >"$STATE/app" 2>/dev/null
+  cue message-new-instant
+  notify "Listening... press F9 to finish" 0 audio-input-microphone
+}
+
+stop_and_type() {
+  local pid text
+  pid=$(cat "$PIDFILE")
+  rm -f "$PIDFILE"
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -INT "$pid"
+    tail --pid="$pid" -f /dev/null
+  fi
+  cue complete
+  notify "Transcribing..." 0 accessories-text-editor
+
+  local t0 audio_bytes
+  t0=$(date +%s.%N)
+  audio_bytes=$(stat -c %s "$WAV" 2>/dev/null || echo 44)
+  if [ "$ENGINE" = parakeet ]; then
+    MODEL="$PARAKEET_MODEL"
+    transcribe() { "$BREW/parakeet-cli" -m "$MODEL" -f "$WAV" -np 2>/dev/null; }
+  else
+    transcribe() { "$BREW/whisper-cli" -m "$MODEL" -f "$WAV" -l "$LANG_CODE" -t 4 \
+      -bs "$BEAM" -bo "$BEAM" --prompt "$PROMPT" --vad -vm "$VAD_MODEL" -nt -np 2>/dev/null; }
+  fi
+  text=$(transcribe \
+    | sed -E 's/\[[^]]*\]//g; s/\([^)]*\)//g; s/^ *- +//' \
+    | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ +//; s/ +$//')
+  rm -f "$WAV"
+  # Text goes in on stdin so it never shows up in a process listing.
+  log() { printf '%s' "$text" | DICTATE_MODEL="$MODEL" /usr/bin/python3 -I "$PROJECT/lib/log_session.py" \
+    basic "$1" "$(cat "$STATE/app" 2>/dev/null)" "$audio_bytes" "$(echo "$(date +%s.%N) - $t0" | bc)" >/dev/null 2>&1; }
+
+  if [ -z "$text" ]; then
+    log empty
+    notify "Didn't catch that. Press F9 and try again." 3000 dialog-warning
+    return
+  fi
+  # Trailing space so consecutive dictations don't run together.
+  xdotool type --clearmodifiers --delay 3 -- "$text "
+  log typed
+  notify "$text" 2500 dialog-information
+}
+
+if [ -s "$PIDFILE" ]; then
+  stop_and_type
+else
+  start_listening
+fi

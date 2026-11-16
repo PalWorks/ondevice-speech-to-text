@@ -1,0 +1,12 @@
+# Large or rebuilt locally by install.sh
+models/
+.venv/
+*.part
+
+# Private: the user's words, usage and conversation log (docs/SECURITY.md)
+data/
+transcripts/
+docs/DISCUSSION.md
+
+__pycache__/
+*.pyc

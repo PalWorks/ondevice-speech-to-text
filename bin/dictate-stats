@@ -1,0 +1,159 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""dictate-stats: summarise your dictation habits from data/sessions.jsonl.
+
+Usage: dictate-stats [--days N] [--json]
+"""
+import argparse
+import collections
+import datetime
+import json
+import os
+import re
+import statistics
+
+PROJECT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+LOG = os.path.join(PROJECT, "data", "sessions.jsonl")
+TYPING_WPM = 40  # typical keyboard speed, for the "time saved" estimate
+STOPWORDS = set("""a an the and or but if so to of in on at for with from by is are was were be been
+it its this that these those i me my we our you your he she they them their his her as not no do does
+did have has had will would can could should just than then there here what which who how all any
+also about into up out over very""".split())
+
+
+def load(days):
+    if not os.path.exists(LOG):
+        return []
+    cutoff = None
+    if days:
+        cutoff = datetime.datetime.now().astimezone() - datetime.timedelta(days=days)
+    rows = []
+    with open(LOG) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                r = json.loads(line)
+                r["_ts"] = datetime.datetime.fromisoformat(r["ts"])
+            except (ValueError, KeyError):
+                continue
+            if cutoff is None or r["_ts"] >= cutoff:
+                rows.append(r)
+    return rows
+
+
+def pct(values, q):
+    values = sorted(v for v in values if v is not None)
+    if not values:
+        return None
+    k = (len(values) - 1) * q
+    lo, hi = int(k), min(int(k) + 1, len(values) - 1)
+    return values[lo] + (values[hi] - values[lo]) * (k - lo)
+
+
+def fmt(v, unit=""):
+    if v is None:
+        return "n/a"
+    return f"{v:.2f}{unit}" if isinstance(v, float) else f"{v}{unit}"
+
+
+def table(name, headers, rows):
+    print(f"\n**{name}**\n")
+    print("| " + " | ".join(headers) + " |")
+    print("|" + "|".join("---" for _ in headers) + "|")
+    for r in rows:
+        print("| " + " | ".join(str(c) for c in r) + " |")
+
+
+def summarise(rows):
+    typed = [r for r in rows if r["outcome"].startswith("typed")]
+    words = sum(r["words"] for r in typed)
+    audio = sum(r["audio_s"] for r in typed)
+    outcomes = collections.Counter(r["outcome"] for r in rows)
+    by_app = collections.defaultdict(lambda: [0, 0, 0.0])
+    for r in typed:
+        a = by_app[r.get("app", "unknown")]
+        a[0] += 1
+        a[1] += r["words"]
+        a[2] += r["audio_s"]
+    hours = collections.Counter(r["_ts"].hour for r in typed)
+    weekdays = collections.Counter(r["_ts"].strftime("%a") for r in typed)
+    days = collections.defaultdict(lambda: [0, 0])
+    for r in typed:
+        d = days[r["_ts"].date().isoformat()]
+        d[0] += 1
+        d[1] += r["words"]
+    vocab = collections.Counter()
+    for r in typed:
+        for w in re.findall(r"[a-zA-Z']+", r.get("text", "").lower()):
+            if w not in STOPWORDS and len(w) > 2:
+                vocab[w] += 1
+    revised = [r for r in typed if r.get("preview_text") is not None]
+    changed = sum(1 for r in revised if r["preview_text"].lstrip("… ").strip() != r.get("text", "").strip())
+    return {
+        "sessions": len(rows),
+        "outcomes": dict(outcomes),
+        "words": words,
+        "audio_min": audio / 60,
+        "wpm_avg": (words / (audio / 60)) if audio else None,
+        "time_saved_min": (words / TYPING_WPM) - (audio / 60) if words else 0,
+        "final_latency_p50": pct([r.get("final_latency_s") for r in typed], 0.5),
+        "final_latency_p90": pct([r.get("final_latency_s") for r in typed], 0.9),
+        "first_preview_p50": pct([r.get("first_preview_s") for r in rows], 0.5),
+        "preview_latency_p50": pct([r.get("preview_latency_avg_s") for r in rows], 0.5),
+        "final_differs_from_preview": f"{changed}/{len(revised)}" if revised else None,
+        "by_app": {k: {"sessions": v[0], "words": v[1], "audio_s": round(v[2], 1)} for k, v in by_app.items()},
+        "by_hour": dict(sorted(hours.items())),
+        "by_weekday": dict(weekdays),
+        "by_day": {k: {"sessions": v[0], "words": v[1]} for k, v in sorted(days.items())},
+        "top_words": vocab.most_common(15),
+    }
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--days", type=int, help="only the last N days")
+    ap.add_argument("--json", action="store_true", help="machine-readable output")
+    args = ap.parse_args()
+    rows = load(args.days)
+    if not rows:
+        print("No sessions logged yet. Press F9, speak, press F9 again.")
+        return
+    s = summarise(rows)
+    if args.json:
+        print(json.dumps(s, indent=2, ensure_ascii=False))
+        return
+
+    span = f"last {args.days} days" if args.days else "all time"
+    print(f"# Dictation stats ({span}, {rows[0]['ts'][:10]} to {rows[-1]['ts'][:10]})")
+    o = s["outcomes"]
+    table("Table S1: Overview", ["Metric", "Value"], [
+        ["Sessions", s["sessions"]],
+        ["Typed / not inserted / empty / cancelled / mic errors",
+         f"{sum(v for k, v in o.items() if k.startswith('typed'))} / {o.get('window_changed', 0) + o.get('origin_closed', 0) + o.get('insert_failed', 0)}"
+         f" / {o.get('empty', 0)} / {o.get('cancelled', 0)} / {o.get('mic_error', 0)}"],
+        ["Words dictated", s["words"]],
+        ["Speaking time", f"{s['audio_min']:.1f} min"],
+        ["Average speaking speed", fmt(s["wpm_avg"] and round(s["wpm_avg"]), " wpm")],
+        [f"Time saved vs typing at {TYPING_WPM} wpm", f"{s['time_saved_min']:.1f} min"],
+    ])
+    table("Table S2: Speed", ["Metric", "p50", "p90"], [
+        ["Wait after the second press (final pass)", fmt(s["final_latency_p50"], " s"), fmt(s["final_latency_p90"], " s")],
+        ["First live words appear after", fmt(s["first_preview_p50"], " s"), ""],
+        ["Live preview refresh", fmt(s["preview_latency_p50"], " s"), ""],
+        ["Final text differed from live preview", s["final_differs_from_preview"] or "n/a", ""],
+    ])
+    apps = sorted(s["by_app"].items(), key=lambda kv: -kv[1]["words"])
+    table("Table S3: Where you dictate", ["App", "Sessions", "Words", "Speaking s"],
+          [[k, v["sessions"], v["words"], v["audio_s"]] for k, v in apps])
+    table("Table S4: When you dictate (hour of day)", ["Hour", "Sessions"],
+          [[f"{h:02d}:00", n] for h, n in s["by_hour"].items()])
+    table("Table S5: Daily trend", ["Day", "Sessions", "Words"],
+          [[d, v["sessions"], v["words"]] for d, v in list(s["by_day"].items())[-14:]])
+    if s["top_words"]:
+        table("Table S6: Most used words", ["Word", "Count"], s["top_words"])
+
+
+if __name__ == "__main__":
+    main()

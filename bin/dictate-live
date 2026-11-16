@@ -1,0 +1,1509 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: AGPL-3.0-only
+"""dictate-live: F9 dictation that types as you talk, and turns conversations into meeting transcripts.
+
+First press: start listening and show a floating box. Each time you pause, the phrase
+goes through the accurate engine (Parakeet by default) and is typed into the window
+where F9 was pressed; while another window is in front, phrases wait and go in when
+you return. A fast whisper model shows the phrase being spoken in grey.
+When a second voice speaks long enough (or the box's Meeting button is clicked), text
+goes to transcripts/ with speaker labels instead. During calls the computer's sound
+is transcribed too.
+Second press: finish the last phrase, insert what is waiting (or save the meeting).
+
+Everything runs locally. Design: docs/ARCHITECTURE.md; terms: docs/DOMAIN.md.
+"""
+import array
+import collections
+import configparser
+import datetime
+import difflib
+import io
+import json
+import math
+import os
+import queue
+import re
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.request
+import uuid
+import wave
+
+import gi
+
+gi.require_version("Gtk", "3.0")
+gi.require_version("Gdk", "3.0")
+from gi.repository import Gdk, GLib, Gtk, Pango  # noqa: E402
+
+PROJECT = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+BREW = os.environ.get("HOMEBREW_PREFIX", "/home/linuxbrew/.linuxbrew") + "/bin"
+SOUNDS = "/usr/share/sounds/freedesktop/stereo"
+STATE = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "dictate-live")
+PIDFILE = os.path.join(STATE, "session.pid")
+POSITION_FILE = os.path.join(PROJECT, "data", "overlay-position.json")
+BACKUP_FILE = os.path.join(PROJECT, "data", "dictations.txt")
+LIVE_DIR = os.path.join(PROJECT, "data", "live")
+TRANSCRIPTS = os.path.join(PROJECT, "transcripts")
+CONFIG_FILE = os.path.join(PROJECT, "config", "dictate.conf")
+SPEAKER_MODEL = "nemo_en_titanet_small.onnx"
+# Window titles that mean a call is open (xdotool regex), besides any app recording the mic.
+CALL_WINDOWS = r"^Meet - |Zoom Meeting|Zoom Workplace|Microsoft Teams|Google Meet"
+# Terminals type pasted text reliably (bracketed paste); long keystroke bursts can be lost.
+TERMINALS = {"xfce4-terminal", "gnome-terminal-server", "gnome-terminal", "xterm", "uxterm", "kitty",
+             "alacritty", "terminator", "tilix", "konsole", "org.wezfurlong.wezterm", "urxvt", "st-256color"}
+RATE = 16000
+BYTES_PER_SEC = RATE * 2
+PREVIEW_WINDOW_S = 28  # whisper sees at most 30 s at a time; preview shows the tail
+
+
+def load_config():
+    cfg = configparser.ConfigParser()
+    cfg.read_dict({"dictate": {
+        "preview_model": "ggml-base.en.bin",
+        "final_engine": "parakeet",
+        "parakeet_model": "ggml-parakeet-tdt-0.6b-v3-q8_0.bin",
+        "final_model": "ggml-large-v3-turbo-q5_0.bin",
+        "final_beam_size": "5",
+        "prompt": "",
+        "vad_model": "ggml-silero-v5.1.2.bin",
+        "language": "en",
+        "threads": "4",
+        "max_seconds": "14400",
+        "silence_stop_seconds": "600",
+        "pause_ms": "700",
+        "max_phrase_seconds": "25",
+        "speech_min_rms": "200",
+        "speech_ratio": "2.5",
+        "meetings": "true",
+        "call_audio": "true",
+        "meeting_min_seconds": "20",
+        "log_sessions": "true",
+        "log_text": "false",
+        "sounds": "true",
+        "hotkey_label": "F9",
+        "backup_text": "true",
+        "backup_keep": "20",
+        "terminal_paste_min_chars": "100",
+    }})
+    cfg.read(CONFIG_FILE)
+    c = cfg["dictate"]
+    models = os.path.join(PROJECT, "models")
+    return {
+        "preview_model": os.path.join(models, os.environ.get("DICTATE_PREVIEW_MODEL", c["preview_model"])),
+        "final_engine": os.environ.get("DICTATE_FINAL_ENGINE", c["final_engine"]),
+        "parakeet_model": os.path.join(models, c["parakeet_model"]),
+        "final_model": os.path.join(models, os.environ.get("DICTATE_FINAL_MODEL", c["final_model"])),
+        "vad_model": os.path.join(models, c["vad_model"]),
+        "language": os.environ.get("DICTATE_LANG", c["language"]),
+        "final_beam_size": c.getint("final_beam_size"),
+        "prompt": c["prompt"],
+        "threads": c.getint("threads"),
+        "max_seconds": c.getint("max_seconds"),
+        "silence_stop_seconds": c.getint("silence_stop_seconds"),
+        "pause_ms": c.getint("pause_ms"),
+        "max_phrase_seconds": c.getint("max_phrase_seconds"),
+        "speech_min_rms": c.getfloat("speech_min_rms"),
+        "speech_ratio": c.getfloat("speech_ratio"),
+        "meetings": c.getboolean("meetings"),
+        "call_audio": c.getboolean("call_audio"),
+        "meeting_min_seconds": c.getint("meeting_min_seconds"),
+        "log_sessions": c.getboolean("log_sessions"),
+        "log_text": c.getboolean("log_text"),
+        "sounds": c.getboolean("sounds"),
+        "hotkey_label": c["hotkey_label"],
+        "backup_text": c.getboolean("backup_text"),
+        "backup_keep": c.getint("backup_keep"),
+        "terminal_paste_min_chars": c.getint("terminal_paste_min_chars"),
+    }
+
+
+def clean(text):
+    text = re.sub(r"\[[^\]]*\]|\([^)]*\)", " ", text)
+    text = re.sub(r"(^|\n)\s*-\s+", r"\1", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def wav_bytes(pcm):
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+def free_port():
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+def active_window():
+    """(window id, WM_CLASS class name) of the focused window."""
+    try:
+        wid = subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True, timeout=2).stdout.strip()
+        out = subprocess.run(["xprop", "-id", wid, "WM_CLASS"], capture_output=True, text=True, timeout=2).stdout
+        names = re.findall(r'"([^"]*)"', out)
+        return wid or None, names[-1] if names else "unknown"
+    except Exception:
+        return None, "unknown"
+
+
+def save_setting(key, value):
+    """Change one `key = value` line in config/dictate.conf, keeping its comments."""
+    try:
+        with open(CONFIG_FILE) as f:
+            text = f.read()
+        new, n = re.subn(rf"(?m)^{re.escape(key)}\s*=.*$", f"{key} = {value}", text)
+        if n == 0:
+            new = text.rstrip("\n") + f"\n{key} = {value}\n"
+        with open(CONFIG_FILE, "w") as f:
+            f.write(new)
+    except OSError:
+        pass
+
+
+def fmt_clock(seconds):
+    seconds = max(int(seconds), 0)
+    return f"{seconds // 3600:02d}:{seconds // 60 % 60:02d}:{seconds % 60:02d}"
+
+
+def active_wid():
+    try:
+        return subprocess.run(["xdotool", "getactivewindow"], capture_output=True, text=True,
+                              timeout=2).stdout.strip() or None
+    except Exception:
+        return None
+
+
+def save_backup(text, keep):
+    """Keep the last `keep` dictations in data/dictations.txt (mode 600), newest first,
+    so text that never reached its window can still be copied from there."""
+    sep = "\n\n"
+    try:
+        with open(BACKUP_FILE) as f:
+            old = [e for e in f.read().split(sep) if e.strip()]
+    except FileNotFoundError:
+        old = []
+    stamp = datetime.datetime.now().astimezone().isoformat(timespec="seconds")
+    entries = [f"[{stamp}]\n{text}"] + old[:max(keep - 1, 0)]
+    fd = os.open(BACKUP_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(sep.join(entries) + "\n")
+    os.chmod(BACKUP_FILE, 0o600)
+
+
+def window_exists(wid):
+    try:
+        return subprocess.run(["xdotool", "getwindowname", wid], capture_output=True, timeout=2).returncode == 0
+    except Exception:
+        return False
+
+
+def clipboard_get():
+    try:
+        r = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, timeout=1)
+        return r.stdout if r.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def clipboard_set(data):
+    """xclip forks and keeps serving the selection after we exit, so no pipes stay open."""
+    p = subprocess.Popen(["xclip", "-selection", "clipboard", "-i"], stdin=subprocess.PIPE,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    p.communicate(data, timeout=2)
+    return p.returncode
+
+
+class WhisperServer:
+    """One whisper-server process holding one model in memory."""
+
+    def __init__(self, model, cfg, extra=()):
+        self.model_name = os.path.basename(model)
+        self.port = free_port()
+        self.url = f"http://127.0.0.1:{self.port}"
+        self.proc = subprocess.Popen(
+            [f"{BREW}/whisper-server", "-m", model, "--host", "127.0.0.1", "--port", str(self.port),
+             "-t", str(cfg["threads"]), "-l", cfg["language"], "--vad", "-vm", cfg["vad_model"], *extra],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        self.ready = threading.Event()
+        threading.Thread(target=self._wait_ready, daemon=True).start()
+
+    def _wait_ready(self):
+        deadline = time.time() + 30
+        while time.time() < deadline and self.proc.poll() is None:
+            try:
+                urllib.request.urlopen(self.url + "/", timeout=1)
+                self.ready.set()
+                return
+            except Exception:
+                time.sleep(0.05)
+
+    def transcribe(self, pcm, timeout=120, prompt=""):
+        if not self.ready.wait(30):
+            raise RuntimeError("whisper-server did not start")
+        boundary = uuid.uuid4().hex
+        fields = {"response_format": "text", "temperature": "0"}
+        if prompt:
+            fields["prompt"] = prompt
+        head = "".join(
+            f"--{boundary}\r\nContent-Disposition: form-data; name=\"{k}\"\r\n\r\n{v}\r\n" for k, v in fields.items())
+        head += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n"
+                 f"Content-Type: audio/wav\r\n\r\n")
+        body = head.encode() + wav_bytes(pcm) + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(self.url + "/inference", data=body,
+                                     headers={"Content-Type": f"multipart/form-data; boundary={boundary}"})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return clean(r.read().decode("utf-8", "replace"))
+
+    def stop(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(3)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+class Parakeet:
+    """NVIDIA Parakeet TDT via whisper.cpp's parakeet-cli (no server mode; loads per call, ~0.5 s).
+
+    Non-autoregressive, so much faster than whisper's beam search, and it ranks
+    above whisper large-v3 on English benchmarks. English and European languages
+    only; no vocabulary prompt.
+    """
+
+    def __init__(self, model):
+        self.model = model
+        self.model_name = os.path.basename(model)
+        self.ready = threading.Event()
+        self.ready.set()
+
+    def transcribe(self, pcm, timeout=120, prompt=""):
+        path = os.path.join(STATE, f"final-{os.getpid()}.wav")
+        with open(path, "wb") as f:
+            f.write(wav_bytes(pcm))
+        try:
+            out = subprocess.run([f"{BREW}/parakeet-cli", "-m", self.model, "-f", path, "-np"],
+                                 capture_output=True, text=True, timeout=timeout, check=True).stdout
+        finally:
+            os.remove(path)
+        return clean(out)
+
+    def stop(self):
+        pass
+
+
+CSS = b"""
+window { background-color: transparent; }
+.pill {
+  background-color: rgba(28, 28, 32, 0.94);
+  border-radius: 18px;
+  border: 1px solid rgba(255, 255, 255, 0.10);
+  padding: 14px 18px;
+}
+.status { color: #f2f2f5; font-weight: 600; font-size: 11pt; }
+.timer  { color: #9a9aa6; font-size: 10pt; font-feature-settings: "tnum"; }
+.dot    { color: #ff453a; font-size: 13pt; }
+.dot.dim { color: rgba(255, 69, 58, 0.35); }
+.live   { color: #ffffff; font-size: 13pt; }
+.live.placeholder { color: #8e8e99; font-style: italic; }
+.hint   { color: #8e8e99; font-size: 9.5pt; }
+.hint b { color: #d0d0d8; }
+button.cancel {
+  color: #d0d0d8; background-image: none; background-color: rgba(255,255,255,0.08);
+  border: none; border-radius: 10px; padding: 6px 14px; min-height: 28px; box-shadow: none;
+}
+button.cancel:hover { background-color: rgba(255,255,255,0.16); }
+button.small { padding: 2px 10px; min-height: 24px; min-width: 24px; }
+.ctl     { color: #d0d0d8; font-size: 9.5pt; }
+.ctl-val { color: #ffffff; font-size: 9.5pt; font-feature-settings: "tnum"; }
+"""
+
+
+class Overlay:
+    WIDTH = 640
+
+    def __init__(self, on_cancel, hotkey, app, on_adjust, on_meeting):
+        self.hotkey = GLib.markup_escape_text(hotkey)
+        self.app = GLib.markup_escape_text(app)
+        self.on_adjust = on_adjust
+        self.level = (0.0, 0.0)
+        provider = Gtk.CssProvider()
+        provider.load_from_data(CSS)
+        Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), provider,
+                                                 Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+        # POPUP windows bypass the window manager: they never take focus,
+        # so the app you are dictating into keeps its cursor.
+        self.win = Gtk.Window(type=Gtk.WindowType.POPUP)
+        self.win.set_accept_focus(False)
+        visual = self.win.get_screen().get_rgba_visual()
+        if visual:
+            self.win.set_visual(visual)
+        self.win.set_app_paintable(True)
+
+        pill = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        pill.get_style_context().add_class("pill")
+        pill.set_size_request(self.WIDTH, -1)
+
+        top = Gtk.Box(spacing=8)
+        self.dot = Gtk.Label(label="●")
+        self.dot.get_style_context().add_class("dot")
+        self.status = Gtk.Label(label="Listening")
+        self.status.get_style_context().add_class("status")
+        self.spinner = Gtk.Spinner()
+        self.timer = Gtk.Label(label="0:00")
+        self.timer.get_style_context().add_class("timer")
+        cancel = Gtk.Button(label="Cancel")
+        cancel.get_style_context().add_class("cancel")
+        cancel.set_can_focus(False)
+        cancel.connect("clicked", lambda *_: on_cancel())
+        top.pack_start(self.dot, False, False, 0)
+        top.pack_start(self.spinner, False, False, 0)
+        top.pack_start(self.status, False, False, 0)
+        top.pack_start(self.timer, False, False, 4)
+        top.pack_end(cancel, False, False, 0)
+        self.cancel_btn = cancel
+        tune = Gtk.Button(label="Tune")
+        self.tune_btn = tune
+        tune.get_style_context().add_class("cancel")
+        tune.set_can_focus(False)
+        tune.connect("clicked", lambda *_: self._toggle_tune())
+        top.pack_end(tune, False, False, 6)
+        meeting = Gtk.Button(label="Meeting")
+        meeting.get_style_context().add_class("cancel")
+        meeting.set_can_focus(False)
+        meeting.set_tooltip_text("Switch to a meeting transcript now")
+        meeting.connect("clicked", lambda *_: on_meeting())
+        top.pack_end(meeting, False, False, 0)
+        self.meeting_btn = meeting
+
+        self.live = Gtk.Label()
+        self.live.get_style_context().add_class("live")  # without it the colour follows the GTK theme
+        self.live.set_line_wrap(True)
+        self.live.set_line_wrap_mode(Pango.WrapMode.WORD_CHAR)
+        self.live.set_xalign(0)
+        self.live.set_max_width_chars(60)
+        self.live.set_lines(3)
+        self.live.set_ellipsize(Pango.EllipsizeMode.START)
+        self.set_text("")
+
+        self.hint = Gtk.Label()
+        self.hint.set_xalign(0)
+        self.set_waiting(0)
+        self.hint.get_style_context().add_class("hint")
+
+        # Tune panel, folded away until "Tune" is clicked: live mic level with the speech
+        # line, and -/+ for sensitivity and pause length (saved to config/dictate.conf).
+        self.tune = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self.meter = Gtk.DrawingArea()
+        self.meter.set_size_request(self.WIDTH - 36, 12)
+        self.meter.connect("draw", self._draw_meter)
+        meter_row = Gtk.Box(spacing=8)
+        mic = Gtk.Label(label="Mic")
+        mic.get_style_context().add_class("ctl")
+        meter_row.pack_start(mic, False, False, 0)
+        meter_row.pack_start(self.meter, True, True, 0)
+        ctl_row = Gtk.Box(spacing=6)
+        self.values = {}
+        for key, title in (("sensitivity", "Sensitivity"), ("pause", "Pause")):
+            label = Gtk.Label(label=title)
+            label.get_style_context().add_class("ctl")
+            ctl_row.pack_start(label, False, False, 0)
+            for delta in (-1, 1):
+                button = Gtk.Button(label="−" if delta < 0 else "+")
+                button.get_style_context().add_class("cancel")
+                button.get_style_context().add_class("small")
+                button.set_can_focus(False)
+                button.connect("clicked", lambda _b, k=key, d=delta: self.set_tune(k, self.on_adjust(k, d)))
+                if delta < 0:
+                    ctl_row.pack_start(button, False, False, 0)
+                    value = Gtk.Label()
+                    value.get_style_context().add_class("ctl-val")
+                    value.set_width_chars(5)
+                    self.values[key] = value
+                    ctl_row.pack_start(value, False, False, 0)
+                else:
+                    ctl_row.pack_start(button, False, False, 0)
+            ctl_row.pack_start(Gtk.Box(), False, False, 10)
+        self.tune.pack_start(meter_row, False, False, 0)
+        self.tune.pack_start(ctl_row, False, False, 0)
+        meter_row.show_all()
+        ctl_row.show_all()
+        self.tune.set_no_show_all(True)  # folded until "Tune" is clicked
+        for key in self.values:
+            self.set_tune(key, self.on_adjust(key, 0))
+
+        pill.pack_start(top, False, False, 0)
+        pill.pack_start(self.live, False, False, 0)
+        pill.pack_start(self.tune, False, False, 0)
+        pill.pack_start(self.hint, False, False, 0)
+
+        # Click and drag anywhere on the box (except Cancel) to move it. The
+        # position is remembered in data/overlay-position.json across sessions.
+        drag = Gtk.EventBox()
+        drag.add(pill)
+        drag.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
+                        | Gdk.EventMask.POINTER_MOTION_MASK)
+        drag.connect("realize", lambda w: w.get_window().set_cursor(
+            Gdk.Cursor.new_from_name(w.get_display(), "grab")))
+        drag.connect("button-press-event", self._drag_start)
+        drag.connect("motion-notify-event", self._drag_move)
+        drag.connect("button-release-event", self._drag_end)
+        self._drag_offset = None
+        self.anchor = self._load_anchor()
+        self.win.add(drag)
+        self.win.connect("size-allocate", lambda *_: self._place())
+        self.win.show_all()
+        self.spinner.hide()
+        self._blink = True
+        GLib.timeout_add(600, self._pulse)
+
+    @staticmethod
+    def _workarea():
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        return monitor.get_workarea()
+
+    def _load_anchor(self):
+        """(left x, bottom y) of the box. The bottom edge is the anchor so the
+        box grows upwards as text wraps, wherever it was dragged to."""
+        try:
+            with open(POSITION_FILE) as f:
+                pos = json.load(f)
+            return int(pos["x"]), int(pos["bottom"])
+        except (FileNotFoundError, ValueError, KeyError, TypeError):
+            return None  # default: centred, 72 px above the bottom of the screen
+
+    def _place(self):
+        if self._drag_offset is not None:
+            return
+        area = self._workarea()
+        w, h = self.win.get_size()
+        if self.anchor is None:
+            x, bottom = area.x + (area.width - w) // 2, area.y + area.height - 72
+        else:
+            x, bottom = self.anchor
+        # Keep the whole box on screen even if the resolution changed.
+        x = max(area.x, min(x, area.x + area.width - w))
+        bottom = max(area.y + h, min(bottom, area.y + area.height))
+        self.win.move(x, bottom - h)
+
+    def _drag_start(self, widget, event):
+        if event.button != 1:
+            return False
+        x, y = self.win.get_position()
+        self._drag_offset = (event.x_root - x, event.y_root - y)
+        widget.get_window().set_cursor(Gdk.Cursor.new_from_name(widget.get_display(), "grabbing"))
+        return True
+
+    def _drag_move(self, widget, event):
+        if self._drag_offset is None:
+            return False
+        dx, dy = self._drag_offset
+        self.win.move(int(event.x_root - dx), int(event.y_root - dy))
+        return True
+
+    def _drag_end(self, widget, event):
+        if self._drag_offset is None:
+            return False
+        self._drag_offset = None
+        widget.get_window().set_cursor(Gdk.Cursor.new_from_name(widget.get_display(), "grab"))
+        x, y = self.win.get_position()
+        self.anchor = (x, y + self.win.get_size()[1])
+        self._place()  # clamps to the screen
+        try:
+            os.makedirs(os.path.dirname(POSITION_FILE), exist_ok=True)
+            with open(POSITION_FILE, "w") as f:
+                json.dump({"x": self.anchor[0], "bottom": self.anchor[1]}, f)
+        except OSError:
+            pass
+        return True
+
+    def _pulse(self):
+        if not self.dot.get_visible():
+            return False
+        ctx = self.dot.get_style_context()
+        (ctx.add_class if self._blink else ctx.remove_class)("dim")
+        self._blink = not self._blink
+        return True
+
+    def set_timer(self, seconds):
+        h, m, s = int(seconds) // 3600, int(seconds) // 60 % 60, int(seconds) % 60
+        self.timer.set_text(f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}")
+
+    def set_text(self, done, speaking=""):
+        """Transcribed phrases in white, the phrase still being spoken in grey."""
+        ctx = self.live.get_style_context()
+        if done or speaking:
+            ctx.remove_class("placeholder")
+            esc = GLib.markup_escape_text
+            # Keep the total under about 3 lines so the ellipsis always sits at the start.
+            if len(speaking) > 200:
+                speaking = "… " + speaking[-200:].split(" ", 1)[-1]
+                done = ""
+            budget = 200 - len(speaking)
+            if len(done) > budget:
+                done = "… " + done[-budget:].split(" ", 1)[-1] if budget > 20 else ""
+            parts = [esc(done)] if done else []
+            if speaking:
+                parts.append(f'<span foreground="#8e8e99">{esc(speaking)}</span>')
+            self.live.set_markup(" ".join(parts))
+        else:
+            ctx.add_class("placeholder")
+            self.live.set_text("Start speaking…")
+
+    def _toggle_tune(self):
+        if self.tune.get_visible():
+            self.tune.hide()
+            self.win.resize(self.WIDTH, 1)  # shrink back; the bottom edge stays put
+        else:
+            self.tune.show()
+
+    def set_tune(self, key, text):
+        self.values[key].set_text(text)
+
+    def set_level(self, rms, threshold):
+        self.level = (rms, threshold)
+        if self.tune.get_visible():
+            self.meter.queue_draw()
+
+    def _draw_meter(self, widget, cr):
+        w, h = widget.get_allocated_width(), widget.get_allocated_height()
+        pos = lambda v: w * min(max(math.log10(max(v, 1)) / 4, 0), 1)  # RMS 1 to 10000, log scale
+        rms, threshold = self.level
+        cr.set_source_rgba(1, 1, 1, 0.10)
+        cr.rectangle(0, 2, w, h - 4)
+        cr.fill()
+        if rms > threshold:
+            cr.set_source_rgb(0.19, 0.82, 0.35)
+        else:
+            cr.set_source_rgba(1, 1, 1, 0.45)
+        cr.rectangle(0, 2, pos(rms), h - 4)
+        cr.fill()
+        cr.set_source_rgb(1, 1, 1)  # the speech line: louder than this counts as speech
+        cr.rectangle(pos(threshold) - 1, 0, 2, h)
+        cr.fill()
+        return False
+
+    def set_status(self, text):
+        self.status.set_text(text)
+
+    def set_hint(self, markup):
+        self.hint.set_markup(markup)
+
+    def set_markup_text(self, markup):
+        self.live.get_style_context().remove_class("placeholder")
+        self.live.set_markup(markup)
+
+    def set_waiting(self, n):
+        if n:
+            self.hint.set_markup(f"<b>{n}</b> phrase{'s' if n > 1 else ''} waiting · "
+                                 f"they go in when you return to <b>{self.app}</b>")
+        else:
+            self.hint.set_markup(f"Text goes into <b>{self.app}</b> at each pause · "
+                                 f"<b>{self.hotkey}</b> to finish")
+
+    def finalizing(self, hint="Transcribing the last phrase"):
+        self.dot.hide()
+        self.tune.hide()
+        self.spinner.show()
+        self.spinner.start()
+        self.status.set_text("Finishing")
+        self.hint.set_markup(hint)
+
+    def message(self, title, hint):
+        self.dot.hide()
+        self.tune.hide()
+        self.tune_btn.hide()
+        self.cancel_btn.hide()
+        self.meeting_btn.hide()
+        self.spinner.hide()
+        self.status.set_text(title)
+        self.live.hide()
+        self.hint.set_markup(hint)
+        self.win.resize(self.WIDTH, 1)
+
+    def close(self):
+        self.win.destroy()
+
+
+class Stream:
+    """One audio source cut into phrases at pauses: the microphone, or the computer's
+    sound while a call is open. Runs its own reader thread; shares the session lock."""
+
+    def __init__(self, name, cmd, session):
+        self.name = name
+        self.s = session
+        self.cfg = session.cfg
+        self.started = time.time()
+        self.phrase = bytearray()  # audio of the phrase being spoken
+        self.phrase_rms = []       # loudness of each 100 ms chunk in self.phrase
+        self.phrase_start = 0      # byte offset of self.phrase within the stream
+        self.phrase_id = 0
+        self.speech_chunks = 0
+        self.silence_chunks = 0
+        self.recent_rms = collections.deque(maxlen=100)  # last 10 s, for the background level
+        self.total_bytes = 0
+        self.last_rms = 0.0
+        self.last_speech = time.time()
+        self.stopping = False
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        threading.Thread(target=self._read, daemon=True).start()
+
+    def _read(self):
+        while True:
+            chunk = self.proc.stdout.read(3200)  # 100 ms
+            if not chunk:
+                if not self.stopping and self.name == "mic":  # arecord died: no mic, or the device is busy
+                    GLib.idle_add(self.s._mic_failed)
+                return
+            samples = array.array("h", chunk)
+            rms = math.sqrt(sum(x * x for x in samples) / max(len(samples), 1))
+            with self.s.lock:
+                if self.stopping or self.total_bytes >= self.s.max_bytes:  # _tick ends the session
+                    continue
+                self.total_bytes += len(chunk)
+                self.last_rms = rms
+                self.phrase.extend(chunk)
+                self.phrase_rms.append(rms)
+                self.recent_rms.append(rms)
+                if self.is_speech(rms):
+                    self.speech_chunks += 1
+                    self.silence_chunks = 0
+                    self.last_speech = time.time()
+                else:
+                    self.silence_chunks += 1
+                self._maybe_cut()
+
+    def floor(self):
+        recent = sorted(self.recent_rms)
+        return recent[len(recent) // 10] if recent else 0
+
+    def threshold(self):
+        """Louder than both speech_min_rms and speech_ratio times the background level,
+        taken as the 10th percentile of the last 10 s (the gaps between words count,
+        so it adapts to fans and hum even while you talk)."""
+        return max(self.floor() * self.cfg["speech_ratio"], self.cfg["speech_min_rms"])
+
+    def is_speech(self, rms):
+        return rms > self.threshold()
+
+    def is_quiet(self, rms):
+        """Clearly background, safe to drop. Chunks between quiet and speech are kept
+        and left to the engine, so soft words are never thrown away."""
+        return rms < max(self.floor() * 1.5, self.cfg["speech_min_rms"] / 2)
+
+    def _maybe_cut(self):
+        """Called with the lock held. Ends the phrase at a pause, or at the quietest
+        moment once it gets too long for one pass. Audio is only dropped when it is
+        clearly background."""
+        if self.speech_chunks == 0:
+            drop = 0
+            while drop < len(self.phrase_rms) - 3 and self.is_quiet(self.phrase_rms[drop]):
+                drop += 1
+            if drop:  # keep 0.3 s of lead-in
+                del self.phrase[:drop * 3200]
+                del self.phrase_rms[:drop]
+                self.phrase_start += drop * 3200
+        chunks = len(self.phrase_rms)
+        if self.speech_chunks and self.silence_chunks * 100 >= self.cfg["pause_ms"]:
+            cut = chunks
+        elif chunks * 0.1 >= self.cfg["max_phrase_seconds"]:
+            tail = range(max(chunks - 30, 1), chunks)
+            cut = min(tail, key=lambda i: self.phrase_rms[i]) + 1
+        else:
+            return
+        self._cut(cut)
+
+    def _cut(self, cut):
+        """Called with the lock held."""
+        pcm = bytes(self.phrase[:cut * 3200])
+        t0 = self.started + self.phrase_start / BYTES_PER_SEC
+        rest_speech = sum(1 for r in self.phrase_rms[cut:] if self.is_speech(r))
+        del self.phrase[:cut * 3200]
+        del self.phrase_rms[:cut]
+        self.phrase_start += cut * 3200
+        self.speech_chunks = rest_speech
+        self.silence_chunks = 0
+        self.phrase_id += 1
+        self.s._enqueue(self, pcm, t0, t0 + len(pcm) / BYTES_PER_SEC)
+
+    def flush(self):
+        """Called with the lock held: send the unfinished phrase unless it is only background."""
+        if any(not self.is_quiet(r) for r in self.phrase_rms):
+            self._cut(len(self.phrase_rms))
+        self.phrase = bytearray()
+        self.phrase_rms = []
+
+    def stop(self):
+        self.stopping = True
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(2)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
+class Speakers:
+    """Voice fingerprints and speaker groups, in a helper process on the project venv
+    (lib/speakers.py, sherpa-onnx). Missing venv or model: no speaker labels, no meeting mode."""
+
+    def __init__(self):
+        python = os.path.join(PROJECT, ".venv", "bin", "python")
+        model = os.path.join(PROJECT, "models", SPEAKER_MODEL)
+        self.proc = None
+        if os.path.exists(python) and os.path.exists(model):
+            self.proc = subprocess.Popen([python, "-I", os.path.join(PROJECT, "lib", "speakers.py"), model],
+                                         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                         stderr=subprocess.DEVNULL, text=True)
+
+    def ask(self, msg):
+        if not self.proc or self.proc.poll() is not None:
+            return None
+        try:
+            self.proc.stdin.write(json.dumps(msg) + "\n")
+            self.proc.stdin.flush()
+            return json.loads(self.proc.stdout.readline())
+        except (OSError, ValueError):
+            return None
+
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
+def call_open(own_pids):
+    """True while a call is likely running: another app records the microphone (Meet,
+    Zoom, Teams all do), or a call window is open. Owner's choice (2026-11-16): the
+    computer's sound is only used then, so a video playing during dictation is ignored."""
+    try:
+        sources = json.loads(subprocess.run(["pactl", "-f", "json", "list", "sources"],
+                                            capture_output=True, text=True, timeout=2).stdout or "[]")
+        monitors = {src["index"] for src in sources if src.get("name", "").endswith(".monitor")}
+        outputs = json.loads(subprocess.run(["pactl", "-f", "json", "list", "source-outputs"],
+                                            capture_output=True, text=True, timeout=2).stdout or "[]")
+        for out in outputs:
+            props = out.get("properties", {})
+            if out.get("source") in monitors or str(props.get("application.process.id")) in own_pids:
+                continue
+            if props.get("application.process.binary") in ("arecord", "parec", "pw-record", "pipewire"):
+                continue
+            return True
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        pass
+    try:
+        titles = subprocess.run(["xdotool", "search", "--onlyvisible", "--name", CALL_WINDOWS],
+                                capture_output=True, text=True, timeout=2).stdout.strip()
+        return bool(titles)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def similar(a, b):
+    """Share of a's words that also appear, in order, in b: catches the call's audio
+    picked up again by the microphone through the laptop speakers."""
+    wa = re.findall(r"[a-z0-9']+", a.lower())
+    wb = re.findall(r"[a-z0-9']+", b.lower())
+    if not wa or not wb:
+        return 0.0
+    match = difflib.SequenceMatcher(None, wa, wb, autojunk=False)
+    return sum(m.size for m in match.get_matching_blocks()) / len(wa)
+
+
+class Session:
+    """One F9 session. Audio is cut into phrases at pauses; each phrase goes through the
+    accurate engine and is inserted into the window where F9 was first pressed while
+    that window is in front, or held until it is back in front (docs/DECISIONS.md D-09).
+    When a second voice is heard long enough, the session turns into a meeting: text
+    goes to a transcript with speaker labels instead of the window."""
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.started = time.time()
+        self.wid, self.app = active_window()
+        self.insert = {}
+        self.lock = threading.Lock()
+        self.max_bytes = cfg["max_seconds"] * BYTES_PER_SEC
+        self.stopping = False
+        self.finishing = False
+        self.done = False
+        self.preview_text = ""
+        self.preview_latencies = []
+        self.first_text_s = None
+        self.queue = queue.Queue()  # phrases waiting for the accurate engine, in order
+        self.pending = 0            # phrases queued or being transcribed
+        self.next_id = 0
+        self.entries = []           # accepted phrases: dicts with id, stream, t0, t1, text, speaker
+        self.held = []              # mic text not yet inserted (original window not in front)
+        self.echo_wait = []         # mic phrases waiting to be compared with the call's audio
+        self.front_ticks = 0
+        self.ticks = 0
+        self.call = None            # Stream of the computer's sound, while a call is open
+        self.call_seen = 0.0
+        self.call_bytes = 0         # audio from calls that already ended
+        self.meeting = False
+        self.live_voices = {}       # transcribe thread: live label -> [seconds, phrases]
+        self.live_primary = None
+        self.confirmed_at = 0.0
+        self.manual_meeting = False
+        self.transcript_path = None
+        self.phrase_latencies = []  # pause detected -> phrase text ready
+        self.stats = {"phrases": 0, "phrase_fallbacks": 0, "live_inserts": 0, "held_flushes": 0,
+                      "insert_failures": 0, "echo_dropped": 0, "call_phrases": 0}
+        self.live_path = os.path.join(LIVE_DIR, datetime.datetime.now().strftime("%Y-%m-%dT%H%M%S") + ".txt")
+
+        self.preview = WhisperServer(cfg["preview_model"], cfg)
+        if cfg["final_engine"] == "parakeet":
+            self.final = Parakeet(cfg["parakeet_model"])
+        else:
+            # Beam search is what whisper-cli does by default; the server defaults to
+            # greedy decoding, which was noticeably less accurate on real speech.
+            beam = str(cfg["final_beam_size"])
+            self.final = WhisperServer(cfg["final_model"], cfg, ("-bs", beam, "-bo", beam))
+        self.speakers = Speakers() if cfg["meetings"] else None
+        self.mic = Stream("mic", ["arecord", "-q", "-t", "raw", "-f", "S16_LE", "-r", str(RATE), "-c", "1"], self)
+        self.cue("message-new-instant")
+        self.overlay = Overlay(self.cancel, cfg["hotkey_label"], self.app, self.adjust, self.start_meeting_now)
+
+        threading.Thread(target=self._preview_loop, daemon=True).start()
+        threading.Thread(target=self._transcribe_loop, daemon=True).start()
+        GLib.timeout_add(250, self._tick)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGUSR1, self._on_toggle)
+        GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, self._on_term)
+
+    def cue(self, name):
+        if self.cfg["sounds"]:
+            subprocess.Popen(["paplay", f"{SOUNDS}/{name}.oga"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+    def streams(self):
+        return [s for s in (self.mic, self.call) if s]
+
+    # Tune panel
+
+    def adjust(self, key, step):
+        """-/+ from the box. Applies at once and is saved for the next session."""
+        if key == "sensitivity":
+            # 1 (least) to 10 (most sensitive) maps to speech_ratio 4.0 down to 1.75.
+            level = round((4.0 - self.cfg["speech_ratio"]) / 0.25) + 1
+            level = min(max(level + step, 1), 10)
+            if step:
+                self.cfg["speech_ratio"] = 4.0 - (level - 1) * 0.25
+                save_setting("speech_ratio", f"{self.cfg['speech_ratio']:.2f}")
+            return str(level)
+        pause = min(max(self.cfg["pause_ms"] + step * 100, 300), 2000)
+        if step:
+            self.cfg["pause_ms"] = pause
+            save_setting("pause_ms", str(pause))
+        return f"{pause / 1000:.1f} s"
+
+    # Phrases
+
+    def _enqueue(self, stream, pcm, t0, t1):
+        """Called with the lock held, from a stream's reader thread."""
+        self.next_id += 1
+        self.pending += 1
+        preview = self.preview_text.lstrip("… ") if stream.name == "mic" else ""
+        self.queue.put({"id": self.next_id, "stream": stream.name, "pcm": pcm, "preview": preview,
+                        "cut_at": time.time(), "t0": t0, "t1": t1})
+        if stream.name == "mic":
+            self.preview_text = ""
+        GLib.idle_add(self._refresh)
+
+    def _preview_loop(self):
+        seen = (0, 0)
+        while not self.stopping:
+            with self.lock:
+                key = (self.mic.phrase_id, len(self.mic.phrase))
+                pcm = bytes(self.mic.phrase[-PREVIEW_WINDOW_S * BYTES_PER_SEC:])
+                speech = self.mic.speech_chunks
+            if (speech == 0 or key[0] == seen[0] and key[1] - seen[1] < BYTES_PER_SEC // 4
+                    or len(pcm) < BYTES_PER_SEC // 2 or not self.preview.ready.is_set()):
+                time.sleep(0.1)
+                continue
+            seen = key
+            t0 = time.time()
+            try:
+                text = self.preview.transcribe(pcm, timeout=10, prompt=self.cfg["prompt"])
+            except Exception:
+                time.sleep(0.3)
+                continue
+            self.preview_latencies.append(time.time() - t0)
+            with self.lock:
+                if self.stopping or self.mic.phrase_id != key[0]:
+                    continue  # that phrase was already cut and sent to the accurate engine
+                if text and self.first_text_s is None:
+                    self.first_text_s = time.time() - self.started
+                self.preview_text = text
+            GLib.idle_add(self._refresh)
+
+    def _transcribe_loop(self):
+        while True:
+            item = self.queue.get()
+            if item is None:
+                return
+            pcm = item["pcm"]
+            if len(pcm) < BYTES_PER_SEC:
+                pcm += bytes(BYTES_PER_SEC - len(pcm))  # very short clips trip the engine
+            item["fallback"] = False
+            try:
+                item["text"] = self.final.transcribe(pcm, prompt=self.cfg["prompt"])
+            except Exception:
+                item["text"], item["fallback"] = item["preview"], True
+            item["speaker"] = None
+            if item["text"] and self.speakers:
+                path = os.path.join(STATE, f"speaker-{os.getpid()}.wav")
+                with open(path, "wb") as f:
+                    f.write(wav_bytes(item["pcm"]))
+                reply = self.speakers.ask({"cmd": "assign", "id": item["id"], "path": path})
+                try:
+                    os.remove(path)  # audio is never kept
+                except OSError:
+                    pass
+                if reply:
+                    item["speaker"] = reply.get("speaker")
+                if self._maybe_meeting(item):
+                    # Live labels can split one voice in two; regroup everything before
+                    # deciding this is really a meeting (at most every 10 s).
+                    self.confirmed_at = time.time()
+                    item["regroup"] = (self.speakers.ask({"cmd": "final"}) or {}).get("labels")
+            del item["pcm"]
+            self.phrase_latencies.append(time.time() - item["cut_at"])
+            GLib.idle_add(self._deliver, item)
+
+    def _deliver(self, item):
+        if self.done:  # cancelled or mic failed: drop late phrases
+            return False
+        self.pending -= 1
+        if item["text"]:
+            self.stats["phrase_fallbacks"] += item["fallback"]
+            if item["stream"] == "mic" and self.call:
+                # Through laptop speakers the mic hears the call too: wait for the call's
+                # own copy of this moment before deciding (_check_echo).
+                item["waiting_since"] = time.time()
+                self.echo_wait.append(item)
+            else:
+                self._accept(item)
+            if item["stream"] == "call":
+                self._check_echo()
+        self._refresh()
+        if self.stopping and self.pending == 0:
+            self._finish()
+        return False
+
+    def _check_echo(self, force=False):
+        """Accept or drop mic phrases that overlap the call's audio in time."""
+        calls = [e for e in self.entries if e["stream"] == "call"]
+        keep = []
+        for item in self.echo_wait:
+            overlapping = [c for c in calls if c["t0"] < item["t1"] + 1 and c["t1"] > item["t0"] - 1]
+            text = " ".join(c["text"] for c in overlapping)
+            if overlapping and similar(item["text"], text) >= 0.6:
+                self.stats["echo_dropped"] += 1
+                continue
+            caught_up = self.call is None or self.call.started + self.call.total_bytes / BYTES_PER_SEC > item["t1"] + 1.5
+            if force or (caught_up and self.pending == 0) or time.time() - item["waiting_since"] > 4:
+                self._accept(item)
+                continue
+            keep.append(item)
+        self.echo_wait = keep
+
+    def _accept(self, item):
+        item["text"] = item["text"].strip()
+        self.entries.append(item)
+        self.stats["phrases"] += 1
+        self.stats["call_phrases"] += item["stream"] == "call"
+        if self.first_text_s is None:
+            self.first_text_s = time.time() - self.started
+        self._write_live(item)
+        self._count_voice(item)
+        if self.meeting:
+            self._write_transcript()
+        elif item["stream"] == "mic":
+            self.held.append(item["text"])
+            if not self.stopping and self._origin_in_front():
+                self._flush("live_inserts")
+
+    def _maybe_meeting(self, item):
+        """Transcribe thread: do the live labels suggest a second voice yet?"""
+        speaker = item["speaker"]
+        if speaker is None or self.meeting:
+            return False
+        if self.live_primary is None and item["stream"] == "mic":
+            self.live_primary = speaker
+        if item["stream"] == "mic" and self.call:
+            return False  # may be the call's audio heard through the speakers; the call's own copy counts
+        v = self.live_voices.setdefault(speaker, [0.0, 0])
+        v[0] += item["t1"] - item["t0"]
+        v[1] += 1
+        return (self.live_primary is not None and time.time() - self.confirmed_at > 10
+                and any(k != self.live_primary and v[0] >= self.cfg["meeting_min_seconds"] and v[1] >= 2
+                        for k, v in self.live_voices.items()))
+
+    def _count_voice(self, item):
+        if not self.meeting and item.get("regroup"):
+            # Entries accepted so far plus this one (it is appended just before this call).
+            if self._second_voice({str(e["id"]): e for e in self.entries}, item["regroup"]):
+                self._start_meeting()
+
+    def _second_voice(self, entries, labels=None):
+        """A voice other than the dictating person's (the first mic phrase) has spoken for
+        meeting_min_seconds across at least 2 phrases."""
+        time_by, count_by = collections.Counter(), collections.Counter()
+        primary = None
+        for key, e in sorted(entries.items(), key=lambda kv: kv[1]["t0"]):
+            label = labels.get(key) if labels is not None else e["speaker"]
+            if label is None:
+                continue
+            if primary is None and e["stream"] == "mic":
+                primary = label
+            time_by[label] += e["t1"] - e["t0"]
+            count_by[label] += 1
+        return primary is not None and any(
+            label != primary and seconds >= self.cfg["meeting_min_seconds"] and count_by[label] >= 2
+            for label, seconds in time_by.items())
+
+    def start_meeting_now(self):
+        """The box's Meeting button: switch at once instead of waiting for a second voice."""
+        if self.meeting or self.stopping:
+            return
+        self.manual_meeting = True
+        self._start_meeting()
+        self._refresh()
+
+    def _start_meeting(self):
+        """A second voice has spoken long enough: from here on text goes to a transcript
+        with speaker labels, not into the window. Text already inserted stays there."""
+        self.meeting = True
+        self.held = []
+        self.overlay.meeting_btn.hide()
+        os.makedirs(TRANSCRIPTS, mode=0o700, exist_ok=True)
+        name = datetime.datetime.fromtimestamp(self.started).strftime("%Y-%m-%d %H%M") + " meeting.md"
+        self.transcript_path = os.path.join(TRANSCRIPTS, name)
+        self._write_transcript()
+        self.cue("bell")
+
+    def _labels(self, final=None):
+        """Speaker number per entry: final labels if given, otherwise the live ones.
+        Phrases too short for a fingerprint take the previous label of their stream."""
+        last = {}
+        out = {}
+        for e in sorted(self.entries, key=lambda e: e["t0"]):
+            label = final.get(str(e["id"])) if final else e["speaker"]
+            if label is None:
+                label = last.get(e["stream"])
+            last[e["stream"]] = label
+            out[e["id"]] = label
+        return out
+
+    def _write_transcript(self, final=None, speakers=None):
+        labels = self._labels(final)
+        start = datetime.datetime.fromtimestamp(self.started)
+        count = speakers if speakers is not None else len({v for v in labels.values() if v is not None})
+        lines = [f"# Meeting {start:%Y-%m-%d %H:%M}", "",
+                 f"Speakers: {count} · Length: {fmt_clock(time.time() - self.started)}"
+                 + ("" if final else " · live labels, corrected when the meeting ends")]
+        previous = object()
+        for e in sorted(self.entries, key=lambda e: e["t0"]):
+            label = labels[e["id"]]
+            who = f"Speaker {label + 1}" if label is not None else "Speaker ?"
+            if label != previous:
+                lines.append("")
+                lines.append(f"**[{fmt_clock(e['t0'] - self.started)}] {who}:** {e['text']}")
+            else:
+                lines[-1] += " " + e["text"]
+            previous = label
+        tmp = self.transcript_path + ".tmp"
+        try:
+            os.makedirs(TRANSCRIPTS, mode=0o700, exist_ok=True)
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as f:
+                f.write("\n".join(lines).strip() + "\n")
+            os.replace(tmp, self.transcript_path)
+        except OSError:
+            pass  # the live file in data/live still has every phrase
+
+    def _write_live(self, item):
+        """Append each phrase to data/live/<start>.txt as it arrives, so nothing is lost
+        if the session crashes. Moved into data/dictations.txt when the session ends."""
+        if not self.cfg["backup_text"]:
+            return
+        try:
+            os.makedirs(LIVE_DIR, mode=0o700, exist_ok=True)
+            fd = os.open(self.live_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+            with os.fdopen(fd, "a") as f:
+                f.write(("[call] " if item["stream"] == "call" else "") + item["text"] + "\n")
+        except OSError:
+            pass
+
+    def _all_text(self):
+        return " ".join(e["text"] for e in sorted(self.entries, key=lambda e: e["t0"]))
+
+    # Inserting into the original window
+
+    def _origin_in_front(self):
+        return self.wid is not None and active_wid() == self.wid
+
+    def _flush(self, counter):
+        """Insert held phrases into the original window, which is in front."""
+        text = " ".join(self.held)
+        method, rc = self._insert_here(text, self.app.lower() in TERMINALS)
+        if rc == 0:
+            self.held = []
+            self.stats[counter] += 1
+        else:
+            self.stats["insert_failures"] += 1
+
+    def _insert_here(self, text, terminal):
+        # Trailing space so consecutive phrases and dictations don't run together.
+        text_out = text + " "
+        if terminal and len(text_out) >= self.cfg["terminal_paste_min_chars"]:
+            return "paste", self._paste(text_out, terminal)
+        return "type", subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "3", "--", text_out],
+                                      stderr=subprocess.DEVNULL).returncode
+
+    def _paste(self, text, terminal):
+        """Paste via the clipboard, then put back the previous text clipboard."""
+        previous = clipboard_get()
+        rc = clipboard_set(text.encode())
+        if rc != 0:
+            return rc
+        rc = subprocess.run(["xdotool", "key", "--clearmodifiers", "ctrl+shift+v" if terminal else "ctrl+v"],
+                            stderr=subprocess.DEVNULL).returncode
+        time.sleep(0.5)  # let the app read the selection before it changes back
+        if previous is not None:
+            clipboard_set(previous)
+        return rc
+
+    # Box
+
+    def _refresh(self):
+        if self.done:
+            return False
+        if self.meeting:
+            labels = self._labels()
+            esc = GLib.markup_escape_text
+            preview = self.preview_text[-150:]
+            budget = 200 - len(preview)  # about 3 lines, so the ellipsis stays at the start
+            turns = []  # consecutive phrases of one speaker shown as one turn
+            for e in sorted(self.entries, key=lambda e: e["t0"]):
+                label = labels[e["id"]]
+                if turns and turns[-1][0] == label:
+                    turns[-1][1] += " " + e["text"]
+                else:
+                    turns.append([label, e["text"]])
+            parts = []
+            for label, text in reversed(turns):
+                if budget <= 20:
+                    break
+                if len(text) > budget:
+                    text = "… " + text[-budget:].split(" ", 1)[-1]
+                budget -= len(text) + 4
+                parts.insert(0, f"<b>S{label + 1 if label is not None else '?'}</b> {esc(text)}")
+            if preview:
+                parts.append(f'<span foreground="#8e8e99">{esc(preview)}</span>')
+            self.overlay.set_markup_text("  ".join(parts))
+            if not self.stopping:
+                count = len({v for v in labels.values() if v is not None})
+                self.overlay.set_status(f"Meeting · {count} speaker{'s' if count != 1 else ''}" if count
+                                        else "Meeting")
+                self.overlay.set_hint("Transcript: <b>" + GLib.markup_escape_text(
+                    os.path.relpath(self.transcript_path, PROJECT)) + "</b> · "
+                    f"<b>{self.overlay.hotkey}</b> to finish")
+            return False
+        self.overlay.set_text(" ".join(e["text"] for e in self.entries if e["stream"] == "mic"),
+                              self.preview_text)
+        if not self.stopping:
+            self.overlay.set_waiting(len(self.held) + len(self.echo_wait))
+        return False
+
+    def _mic_failed(self):
+        if self.done or self.stopping:
+            return False
+        self._stop_recording()
+        self.queue.put(None)
+        self.final.stop()
+        self._save_text()
+        self.log("mic_error", self._all_text(), None)
+        self.overlay.message("Microphone not available",
+                             "Check the input device in Sound settings, then try again")
+        GLib.timeout_add(3000, self._quit)
+        return False
+
+    def _tick(self):
+        if self.stopping:
+            return False
+        now = time.time()
+        self.ticks += 1
+        self.overlay.set_timer(now - self.started)
+        self.overlay.set_level(self.mic.last_rms, self.mic.threshold())
+        last_speech = max(s.last_speech for s in self.streams())
+        if (self.mic.total_bytes >= self.max_bytes
+                or now - last_speech >= self.cfg["silence_stop_seconds"]):
+            self._on_toggle()
+            return False
+        if self.ticks % 8 == 0 and self.cfg["call_audio"] and self.speakers:
+            self._watch_call(now)
+        if self.echo_wait:
+            self._check_echo()
+            self._refresh()
+        # Held phrases go in once the original window has been in front for two ticks
+        # (about 0.5 s), so they don't mix with keys typed right after switching back.
+        self.front_ticks = self.front_ticks + 1 if self._origin_in_front() else 0
+        if self.held and self.front_ticks >= 2 and not self.meeting:
+            self._flush("held_flushes")
+            self._refresh()
+        return True
+
+    def _watch_call(self, now):
+        """Every 2 s: record the computer's sound while a call is open, stop 15 s after."""
+        own = {str(os.getpid()), str(self.mic.proc.pid)}
+        if self.call:
+            own.add(str(self.call.proc.pid))
+        if call_open(own):
+            self.call_seen = now
+            if self.call is None:
+                self.call = Stream("call", ["parec", "--device=@DEFAULT_MONITOR@", "--format=s16le",
+                                            f"--rate={RATE}", "--channels=1", "--raw"], self)
+        elif self.call and now - self.call_seen > 15:
+            with self.lock:
+                self.call.flush()
+                self.call.stopping = True
+            self.call.stop()
+            self.call_bytes += self.call.total_bytes
+            self.call = None
+
+    def _stop_recording(self):
+        self.stopping = True
+        for stream in self.streams():
+            stream.stop()
+        self.preview.stop()
+
+    def _on_toggle(self):
+        if self.stopping:
+            return GLib.SOURCE_CONTINUE
+        self.t_stop = time.time()
+        self._stop_recording()
+        with self.lock:
+            for stream in self.streams():
+                stream.flush()
+        self.cue("complete")
+        self.overlay.finalizing("Labelling speakers and saving the transcript" if self.meeting
+                                else "Transcribing the last phrase")
+        if self.pending == 0:
+            self._finish()
+        return GLib.SOURCE_CONTINUE
+
+    def _on_term(self):
+        self.cancel()
+        return GLib.SOURCE_REMOVE
+
+    def cancel(self):
+        """Stop and drop text not yet inserted; text already inserted stays where it is.
+        A meeting transcript keeps what was written so far."""
+        if self.done:
+            return
+        self._stop_recording()
+        self.queue.put(None)
+        self.final.stop()
+        if self.speakers:
+            self.speakers.stop()
+        self._save_text()
+        self.log("cancelled", self._all_text(), None)
+        self._quit()
+
+    def _save_text(self):
+        if self.entries and self.cfg["backup_text"]:
+            try:
+                save_backup(self._all_text(), self.cfg["backup_keep"])
+                os.remove(self.live_path)
+            except OSError:
+                pass
+
+    def _finish(self):
+        if self.finishing or self.done:
+            return
+        self.finishing = True
+        self.queue.put(None)
+        self.final.stop()
+        self._check_echo(force=True)
+        if self.meeting:
+            threading.Thread(target=self._finish_meeting, daemon=True).start()
+            return
+        if self.speakers:
+            self.speakers.stop()
+        latency = time.time() - self.t_stop
+        self._save_text()
+        if not self.entries:
+            self.log("empty", "", latency)
+            self.overlay.message("Didn't catch that",
+                                 f"Press <b>{self.overlay.hotkey}</b> and try again, a little closer to the mic")
+            GLib.timeout_add(2200, self._quit)
+            return
+        outcome = "typed_preview_fallback" if self.stats["phrase_fallbacks"] else "typed"
+        if not self.held:
+            if self.stats["insert_failures"]:
+                outcome = "insert_failed"
+            self.log(outcome, self._all_text(), latency)
+            self.overlay.close()
+            self._quit()
+            return
+        self._insert_final(" ".join(self.held), outcome, latency)
+
+    def _finish_meeting(self):
+        reply = (self.speakers.ask({"cmd": "final"}) if self.speakers else None) or {}
+        if self.speakers:
+            self.speakers.stop()
+        GLib.idle_add(self._meeting_saved, reply.get("labels"), reply.get("speakers"))
+
+    def _meeting_saved(self, labels, speakers):
+        if self.done:
+            return False
+        self._write_transcript(labels, speakers)
+        self._save_text()
+        self.meeting_speakers = speakers
+        clipboard_set(self.transcript_path.encode())
+        name = GLib.markup_escape_text(os.path.basename(self.transcript_path))
+        subprocess.Popen(["notify-send", "-a", "Dictation", "Meeting transcript saved",
+                          f"{self.transcript_path} (path copied)"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.log("meeting", self._all_text(), time.time() - self.t_stop)
+        self.overlay.message("Transcript saved",
+                             f"<b>{name}</b> in transcripts/ · path copied, press <b>Ctrl+V</b> to paste it")
+        GLib.timeout_add(5000, self._quit)
+        return False
+
+    def _insert_final(self, text, outcome, latency):
+        """Insert what is still held into the original window, wherever focus is now."""
+        wid = active_wid()
+        switched = wid != self.wid
+        self.insert = {"insert_app": active_window()[1], "window_changed": switched}
+        if self.wid is None or (switched and not window_exists(self.wid)):
+            clipboard_set(text.encode())
+            self.insert.update(insert_method="clipboard_only", insert_rc=None, insert_s=None)
+            self.log("origin_closed", self._all_text(), latency)
+            self.overlay.message("Not inserted: the original window is closed",
+                                 "Text copied. Press <b>Ctrl+V</b> where you want it")
+            GLib.timeout_add(4000, self._quit)
+            return
+        self.overlay.close()
+        terminal = self.app.lower() in TERMINALS
+        t0 = time.time()
+        rc = 0
+        if switched:
+            # Focus the original window, paste (fast, so the detour is short), hand focus back.
+            rc = subprocess.run(["xdotool", "windowactivate", "--sync", self.wid],
+                                stderr=subprocess.DEVNULL, timeout=3).returncode
+        if rc != 0:
+            method = "activate_failed"
+        elif switched:
+            method, rc = "paste", self._paste(text + " ", terminal)
+        else:
+            method, rc = self._insert_here(text, terminal)
+        if switched:
+            subprocess.run(["xdotool", "windowactivate", wid], stderr=subprocess.DEVNULL, timeout=3)
+        self.insert.update(insert_method=method, insert_rc=rc, insert_s=round(time.time() - t0, 2))
+        if rc != 0 or self.stats["insert_failures"]:
+            outcome = "insert_failed"
+        if rc != 0:
+            clipboard_set(text.encode())
+            subprocess.Popen(["notify-send", "-a", "Dictation", "Dictation not inserted",
+                              "Text copied to the clipboard and saved in data/dictations.txt"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.log(outcome, self._all_text(), latency)
+        self._quit()
+
+    def log(self, outcome, text, final_latency):
+        if self.done:
+            return
+        self.done = True
+        if not self.cfg["log_sessions"]:
+            return
+        audio_s = self.mic.total_bytes / BYTES_PER_SEC
+        words = len(text.split())
+        lat = self.preview_latencies
+        entry = {
+            "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+            "mode": "live",
+            "outcome": outcome,
+            "app": self.app,
+            "language": self.cfg["language"],
+            "audio_s": round(audio_s, 2),
+            "words": words,
+            "chars": len(text),
+            "wpm": round(words / (audio_s / 60), 1) if audio_s > 1 and words else None,
+            "final_latency_s": round(final_latency, 2) if final_latency is not None else None,
+            "first_preview_s": round(self.first_text_s, 2) if self.first_text_s else None,
+            "preview_updates": len(lat),
+            "preview_latency_avg_s": round(sum(lat) / len(lat), 2) if lat else None,
+            "preview_model": os.path.basename(self.cfg["preview_model"]),
+            "final_model": self.final.model_name,
+            **self.stats,
+            "phrase_latency_avg_s": (round(sum(self.phrase_latencies) / len(self.phrase_latencies), 2)
+                                     if self.phrase_latencies else None),
+            "meeting": self.meeting,
+            "meeting_manual": self.manual_meeting,
+            "speakers": getattr(self, "meeting_speakers", None),
+            "call_audio_s": round((self.call_bytes + (self.call.total_bytes if self.call else 0)) / BYTES_PER_SEC, 1),
+            **self.insert,
+        }
+        if self.cfg["log_text"]:
+            entry["text"] = text
+            entry["preview_text"] = self.preview_text
+        os.makedirs(os.path.join(PROJECT, "data"), exist_ok=True)
+        with open(os.path.join(PROJECT, "data", "sessions.jsonl"), "a") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+    def _quit(self):
+        self.preview.stop()
+        self.final.stop()
+        if self.speakers:
+            self.speakers.stop()
+        try:
+            os.remove(PIDFILE)
+        except FileNotFoundError:
+            pass
+        Gtk.main_quit()
+        return False
+
+
+def running_pid():
+    """PID of a live dictate-live session, or None.
+
+    Checks the command line too: after a crash the pidfile can be stale and the
+    PID reused by an unrelated process, which SIGUSR1 would kill.
+    """
+    try:
+        pid = int(open(PIDFILE).read().strip())
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            if b"dictate-live" in f.read():
+                return pid
+    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+        pass
+    return None
+
+
+def main():
+    os.makedirs(STATE, exist_ok=True)
+    pid = running_pid()
+    if pid:
+        os.kill(pid, signal.SIGUSR1)
+        return
+    Session(load_config())
+    # Written after Session() so the SIGUSR1 handler exists before anyone can signal us.
+    with open(PIDFILE, "w") as f:
+        f.write(str(os.getpid()))
+    Gtk.main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: AGPL-3.0-only
+# dictate-compare: record one clip of your voice and transcribe it with every
+# candidate engine, side by side, so you can pick the most accurate one.
+# Nothing is saved: the clip lives in $XDG_RUNTIME_DIR and is deleted at the end.
+#
+# Usage: dictate-compare            (record from the mic, press Enter to stop)
+#        dictate-compare file.wav   (use an existing 16 kHz mono WAV)
+set -u
+
+BREW=/home/linuxbrew/.linuxbrew/bin
+PROJECT="$(dirname "$(dirname "$(realpath "$0")")")"
+M="$PROJECT/models"
+VAD="$M/ggml-silero-v5.1.2.bin"
+PROMPT="$(/usr/bin/python3 -I -c 'import configparser,sys; c=configparser.ConfigParser(); c.read(sys.argv[1]); print(c.get("dictate","prompt",fallback=""))' "$PROJECT/config/dictate.conf")"
+WAV="${XDG_RUNTIME_DIR:-/tmp}/dictate-compare.wav"
+
+if [ $# -ge 1 ]; then
+  WAV="$1"
+else
+  trap 'rm -f "$WAV"' EXIT
+  echo "Recording. Speak the way you normally dictate, then press Enter."
+  arecord -q -f S16_LE -r 16000 -c 1 -d 300 "$WAV" &
+  rec=$!
+  read -r
+  kill -INT "$rec"
+  wait "$rec" 2>/dev/null
+fi
+
+secs=$(( ($(stat -c %s "$WAV") - 44) / 32000 ))
+echo
+echo "**Table C1: Engines on your ${secs}s clip** (time includes model load)"
+echo
+echo "| Engine | Time | Transcript |"
+echo "|---|---|---|"
+
+run() { # label, command...
+  local label=$1 s out
+  shift
+  s=$(date +%s.%N)
+  out=$("$@" 2>/dev/null | sed -E 's/\[[^]]*\]//g; s/\([^)]*\)//g; s/^ *- +//' | tr '\n' ' ' | tr -s ' ' | sed -E 's/^ +//; s/ +$//')
+  printf '| %s | %.1fs | %s |\n' "$label" "$(echo "$(date +%s.%N) - $s" | bc)" "${out:-(empty)}"
+}
+
+run "parakeet tdt 0.6b v3 (default)" "$BREW/parakeet-cli" -m "$M/ggml-parakeet-tdt-0.6b-v3-q8_0.bin" -f "$WAV" -np
+run "whisper large-v3-turbo, beam 5" "$BREW/whisper-cli" -m "$M/ggml-large-v3-turbo-q5_0.bin" -f "$WAV" -l en -t 4 -bs 5 -bo 5 --prompt "$PROMPT" --vad -vm "$VAD" -nt -np
+run "whisper small.en, beam 5 (F9 basic before)" "$BREW/whisper-cli" -m "$M/ggml-small.en.bin" -f "$WAV" -l en -t 4 -bs 5 -bo 5 --vad -vm "$VAD" -nt -np
+run "whisper small.en, greedy (live v1)" "$BREW/whisper-cli" -m "$M/ggml-small.en.bin" -f "$WAV" -l en -t 4 -bs -1 -bo 1 --vad -vm "$VAD" -nt -np
+run "whisper base.en (live preview)" "$BREW/whisper-cli" -m "$M/ggml-base.en.bin" -f "$WAV" -l en -t 4 --prompt "$PROMPT" --vad -vm "$VAD" -nt -np
+echo
+echo "To switch engines: edit final_engine / final_model in $PROJECT/config/dictate.conf"
